@@ -5,7 +5,6 @@ import argparse
 import numpy as np
 from matplotlib import cm
 import matplotlib.pyplot as plt
-import astropy.io.fits as fits
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
 import warnings
@@ -24,51 +23,45 @@ DEVICE = 'cuda'
 ffmpeg_kargs = {'macro_block_size': None, 'ffmpeg_params': ['-s','256x256', '-v', '0'], 'fps': 4, }
 
 
-def load_data(N, data_dir, opd_data_dir):
+def load_data(N, data_dir, opd_data_dir, multi_snap):
     aperture = np.load(f'{data_dir}/primary_transmission_1024.npy')
     aperture = np.flip(aperture, axis=0) # Flipping to make aperture coincide with Lyot
     lyot = np.load(f'{data_dir}/circlyotstop_transmission_1024.npy')
     fpm = np.load(f'{data_dir}/transmission_MASK335R_4_5um_2048.npy')
     nircam_opd = np.load(f'{data_dir}/FDA_NIRCamLWA_opd_1024.npy')
 
-    #aperture_opd = np.load(f'{data_dir}/primary_EXAMPLE_opd_1024.npy')
-    aperture_opd = np.load(f'{opd_data_dir}/opd_2022-08-11T04_06_35.842.npy')
-    aperture_opd = np.flip(aperture_opd, axis=0) # Flipping to make aperture coincide with Lyot
-    sampledWFEs = np.repeat(np.array([aperture_opd]), N, axis=0)
+    aperture_opd_list = []
+    for opd_file in sorted(os.listdir(opd_data_dir)):
+        if opd_file.endswith('.npy'):
+            opd = np.load(os.path.join(opd_data_dir, opd_file))
+            opd = np.flip(opd, axis=0) # Flipping to make aperture coincide with Lyot
+            aperture_opd_list.append(opd)
+    aperture_opd_list = np.array(aperture_opd_list)
 
-    aperture_opd2 = np.load(f'{opd_data_dir}/opd_2022-08-14T17_58_37.084.npy')
-    aperture_opd2 = np.flip(aperture_opd2, axis=0) # Flipping to make aperture coincide with Lyot
-    sampledWFEs_2 = np.repeat(np.array([aperture_opd2]), N, axis=0)
+    sampledWFEs = aperture_opd_list[0:1]
+    sampledWFEs_2 = aperture_opd_list[1:2]
 
+    if N > 1:
+        sampledWFEs = np.repeat(sampledWFEs, N, axis=0)
+        sampledWFEs_2 = np.repeat(sampledWFEs_2, N, axis=0)
+
+    if N > 1 and multi_snap:
+        delta = sampledWFEs_2 - sampledWFEs
+        increment = np.linspace(0.5, 1, N)
+        sampledWFEs_2 = sampledWFEs + delta * increment[:, None, None]
 
     return aperture, lyot, fpm, nircam_opd, sampledWFEs, sampledWFEs_2
 
 
-class G_Tensor(nn.Module):
-    def __init__(self, x_dim, y_dim, num_imgs):
-        super().__init__()
-        self.num_imgs = num_imgs
-        self.data = nn.Parameter(torch.zeros((num_imgs, x_dim, y_dim, 64)), requires_grad=True)
-        self.proj = nn.Linear(64, 64)
-        self.proj2 = nn.Linear(64, 1)
-
-    def forward(self):
-        out = self.data @ self.proj.weight.t()
-        out = torch.sin(out)
-        out = out @ self.proj2.weight.t()
-        out = out.squeeze(-1)
-        return out
-
-
 class Wavefront(nn.Module):
-    def __init__(self, npixels: int, diameter: float, wavelength: float, flux: float, angles = None):
+    def __init__(self, npixels: int, diameter: float, wavelength: float, peak_flux: float, angles = None):
         super().__init__()
         self.wavelength = nn.Parameter(torch.from_numpy(np.asarray(wavelength, float)), requires_grad=False)
         self.pixel_scale = nn.Parameter(torch.from_numpy(np.asarray(diameter / npixels, float)), requires_grad=False)
         self.wavenumber = 2 * np.pi / self.wavelength
         self.npixels = npixels
         self.diameter = diameter
-        self.flux = flux
+        self.peak_flux = peak_flux
         self.coordinates = nn.Parameter(pixel_coords(self.npixels, self.diameter), requires_grad=False)
         if angles is None:
             angles = torch.zeros(2)
@@ -125,10 +118,13 @@ class Wavefront(nn.Module):
 
         return phasor
 
-    def forward(self, phasor, layer):
+    def forward(self, phasor, layer, normalize=False):
         new_phasor = phasor * layer
-        denom = new_phasor.abs() ** 2
-        denom = torch.sum(denom, dim=(1, 2), keepdim=True) ** 0.5
+        if normalize:
+            denom = new_phasor.abs() ** 2
+            denom = torch.sum(denom, dim=(1, 2), keepdim=True) ** 0.5
+        else:
+            denom = 1.
         return new_phasor / denom
 
     def forward_fpm(self, phasor, layer):
@@ -161,14 +157,14 @@ class PointPropagate(nn.Module):
     def forward(self, wavefront, wfe):
         phasor = wavefront.get_phasor()
         phasor = wavefront.forward_wfe(phasor, wfe)
-        phasor = wavefront.forward(phasor, self.aperture)
+        phasor = wavefront.forward(phasor, self.aperture,normalize=True)
         phasor = wavefront.forward_fpm(phasor, self.fpm)
         phasor = wavefront.forward(phasor, self.lyot)
         phasor = wavefront.forward_wfe(phasor, self.nircam_opd)
 
         phasor = (self.y_mat.T @ phasor) @ self.x_mat
         phasor *= self.mult
-        w = wavefront.flux ** 0.5
+        w = wavefront.peak_flux ** 0.5
         out = (torch.abs(phasor) * w) ** 2
 
         return out
@@ -178,7 +174,7 @@ class PointPropagate(nn.Module):
         phasor = wavefront.forward(phasor, self.aperture)
         phasor = (self.y_mat.T @ phasor) @ self.x_mat
         phasor *= self.mult
-        w = wavefront.flux ** 0.5
+        w = wavefront.peak_flux ** 0.5
         out = (torch.abs(phasor) * w) ** 2
 
         return out
@@ -191,28 +187,27 @@ if __name__ == "__main__":
     parser.add_argument('--data_dir', default='./FilesJWSTMasks/masks_1024', type=str)
     parser.add_argument('--opd_data_dir', default='./OPDs_JWST_dates', type=str)
     parser.add_argument('--scene_name', default='guidestar', type=str)
-    parser.add_argument('--num_t', help='Number of measurements', default=32, type=int)
+    parser.add_argument('--num_t', help='Number of measurements', default=1, type=int)
     parser.add_argument('--contrast_mult', default=1, type=float)
-    parser.add_argument('--contrast_exp', default=-8, type=int)
+    parser.add_argument('--contrast_exp', default=-5, type=int)
     parser.add_argument('--vis_freq', default=100, type=int)
     parser.add_argument('--iters', default=200, type=int)
     parser.add_argument('--lr', default=1e-10, type=float)
-    parser.add_argument('--offset_x', default=2.8481e-6, type=float)
-    parser.add_argument('--offset_y', default=1.5481e-6, type=float)
-    parser.add_argument('--photon_noise', default=0.0, type=float, help='Photon noise level')
-
+    parser.add_argument('--offset_r', default=0.6, type=float)
+    parser.add_argument('--offset_t', default=0.3, type=float)
+    parser.add_argument('--shot_noise', default=1.0, type=float, help='Shot noise level')
+    parser.add_argument('--read_noise', default=42.0, type=float, help='Read noise level')
     parser.add_argument('--loss_fn', default='L1', type=str)
-    parser.add_argument('--error_ratio', default=0.01, type=float)
-    parser.add_argument('--iid', action='store_true')
+    parser.add_argument('--drift_ratio', default=1.0, type=float)
     parser.add_argument('--log_progress', action='store_true')
-    parser.add_argument('--INR', action='store_true')
+    parser.add_argument('--multi_snapshot', action='store_true')
 
     args = parser.parse_args()
 
     # Planet contrast
     planet_contrast = args.contrast_mult * (10 ** args.contrast_exp)
     # Ratio of error to add to the WFE
-    error_ratio = args.error_ratio
+    drift_ratio = args.drift_ratio
     # Number of measurements
     N = args.num_t
     # Number of iterations
@@ -237,10 +232,14 @@ if __name__ == "__main__":
     # Radius of the PSF in pixels
     psf_radius = (psf_npix * arcsec2rad(psf_pixel_scale)) / 2
     # Offset of the planet from the center of the PSF
-    offset = torch.FloatTensor([args.offset_x, args.offset_y]).view(2)
+    #offset = torch.FloatTensor([args.offset_x, args.offset_y]).view(2)    
+    coord_r, coord_t = args.offset_r, args.offset_t * np.pi
+    coord_x = arcsec2rad(coord_r * np.cos(coord_t))
+    coord_y = arcsec2rad(coord_r * np.sin(coord_t))
+    offset = torch.FloatTensor([coord_x, coord_y]).view(2)
 
     # Load data from args.data_dir
-    aperture, lyot, fpm, nircam_OPD, sampledWFEs, sampledWFEs_2 = load_data(N=N, data_dir=args.data_dir, opd_data_dir=args.opd_data_dir)
+    aperture, lyot, fpm, nircam_OPD, sampledWFEs, sampledWFEs_2 = load_data(N=N, data_dir=args.data_dir, opd_data_dir=args.opd_data_dir, multi_snap=args.multi_snapshot)
 
     coords = pixel_coords(wf_npix, diameter)
     aperture = circle(coords, 0.5 * diameter).to(DEVICE)[None]
@@ -255,51 +254,79 @@ if __name__ == "__main__":
 
     if len(sampledWFEs.shape) == 2:
         sampledWFEs = sampledWFEs.unsqueeze(0).repeat(2, 1, 1)
-    if not args.iid:
-        a, b = sampledWFEs[:1], sampledWFEs[1:2]
-        sampledWFEs = torch.cat([a * e + b * (1 - e) for e in np.linspace(0, 1, N)])
+
+    a, b = sampledWFEs[:1], sampledWFEs[1:2]
+    sampledWFEs = torch.cat([a * e + b * (1 - e) for e in np.linspace(0, 1, N)])
     sampledWFEs = sampledWFEs.to(DEVICE)
     sampledWFEs_2 = sampledWFEs_2.to(DEVICE)
 
     ############
     # Set up export directories
-    vis_dir = f'{args.root_dir}/vis/{args.scene_name}/N{args.num_t}/{args.contrast_mult}x10_{args.contrast_exp}_err_{error_ratio}_off_{args.offset_x}_{args.offset_y}'
-    if args.iid:
-        vis_dir += '_iid'
+    vis_dir = f'{args.root_dir}/vis/{args.scene_name}/N{args.num_t}/{args.contrast_mult}x10_{args.contrast_exp}_err_{drift_ratio}_off_{args.offset_r}_{args.offset_t}'
+
     if args.loss_fn == 'L2':
         vis_dir += '_L2_loss'
-    if args.photon_noise > 0:
-        vis_dir += f'_pho_noise_{args.photon_noise}'
+    if args.shot_noise > 0:
+        vis_dir += f'_shot_noise_{args.shot_noise}'
     os.makedirs(f'{args.root_dir}/vis', exist_ok=True)
     os.makedirs(vis_dir, exist_ok=True)
 
-    total_photons_real = 11120936 # total number of photons in the science image detector of JWST from Aarynn's program (rough estimate)
-    peak_pixel_photons_real = 71095 # number of photons at the brightest pixel at science image detector, using the same estimate as above
+    # NEW PHOTOMETRIC CALIBRATION: Based on a 2 hour exposure of the star Beta Pictoris, using its W2 apparent magnitude
+    # (i.e. its brightness at 4.6 microns, which is the wavelength/filter we are interested in) from the WISEA catalog:
+    # https://vizier.cds.unistra.fr/viz-bin/VizieR-S?WISEA%20J054717.10-510358.4
+    # And using the zero point of the F444W filter in the NIRCam instrument of JWST.
+
+    # Using photometry data from the JWST files as well, we use the conversion of 1 count per second ~ 2.51 MJy/sr
+    # Since we are working at 4.5 microns, we assume a detector gain of 1.84 and a quantum efficiency of 80%.
+
+    # All conversions done using the peak pixel of the simulations and the peak pixel of real data,
+    # so we do the same here. The "flux" parameter was changed to "peak flux" and is used in this way.
+
+    # Brightness of the peak pixel of an unocculted (e.g. no focal plane mask) star;
+    # dividing the image by this gives by definition the image in contrast units
+    # if the image is simulated the way it is simulated here
+    # (i.e. total intensity in aperture = 1, and electric field is not
+    # normalized when passing through each mask to capture the real throughput).
+    contrast_normalization = 0.003716380479003919
+
+    # From calibration with stellar photometry described above, this is the number of photons
+    # corresponding to a contrast = 1 for a 2 hour observation of Beta Pictoris (computed from
+    # the zero point of F444W in JWST's NIRCam and Beta Pictoris' brightness or magnitude in that filter).
+    # So multiplying an image in contrast units by this amount gives the image in photons.
+    photons_normalization = 10334325889.379316
     
-    # Calibrating star flux
-    peak_pixel_intensity_fraction_sim = 0.004 # Empirically, about this much of the original flux ends up in the brightest
-                                                # pixel of the simulation.
-    flux_fraction_to_detector_star_sim = 0.799 # Empirically, the flux at the detector in this simulation is about 79.9% of the
-                                        # flux specified in the flux parameter of the wavefront in the simulation. 
-    input_flux_star = 1 / flux_fraction_to_detector_star_sim * total_photons_real # Rough estimate
+    # IMPORTANT CHANGE:
+    # Now we compute the peak fluxes. These are the peak fluxes we would get if we
+    # observe the sources without the focal plane mask. This is what we want since it more
+    # realistically captures the resulting flux at the end of the detector, now that our
+    # model captures the true optical throughput.
+    peak_flux_star  = photons_normalization / contrast_normalization
 
-    # Calibrating planet flux
-    desired_contrast_ratio = planet_contrast
-    ratio_peak_occulted_to_peak_unocculted = 0.0011 # In webbPSF, the peak pixel of the occulted star PSF is about 0.0011 times the
-                                                    # brightness of the peak pixel of the unocculted star PSF
-    peak_photons_star_unocculted = peak_pixel_photons_real / ratio_peak_occulted_to_peak_unocculted
-    peak_photons_planet_sim = desired_contrast_ratio * peak_photons_star_unocculted
+    # VERY IMPORTANT CHANGE:
+    # Same thing for the planet here. One important consequence is that now
+    # the desired contrast is set to be the true contrast of the planet to the star,
+    # if we were to see the planet without the focal plane mask. This is important because:
+    #     1) This is the way "contrast" is reported in the literature.
+    #     2) If the planet is closer to the focal plane mask (e.g., within like 0.8 arcseconds)
+    #        the planet itself can be partially occulted too by the mask, resulting in the planet 
+    #        appearing at the detector *fainter* than the true contrast.
+    #     3) For planets far from the focal plane mask (e.g., more than 1 arcsecond) the occulting
+    #        is almost negligible, and the planet appears at the detector with pretty much the same
+    #        brightness (contrast) as the true value. For planets closer in, the occulting is not
+    #        negligible, but as close as 0.6 arcseconds (the inner working angle)
+    #        the difference is only like a factor of 2. So in our scales, our dynamic range 
+    #        (orders of magnitude) is large enough that the difference in performance will not 
+    #        be too dramatic.
+    #        But for even closer in planets, the occulting is more severe, and it causes a change in
+    #        measured contrast of one order of magnitude or more for planets inside ~0.4 arcseconds.
+    #        So if any planet is tested inside this range, it must be done in this new way to account
+    #        for how fainter (than its true brightness) the planet would appear to us in real life in 
+    #        that position of the field of view.
+    # This new way of simulating the planet allows way more realistic simulations, since (in short)
+    # it includes more effects of the field-of-view dependence on the throughput of the planet.
 
-    peak_pixel_to_total_detector_planet_sim = 0.0238 # Empirically, the peak pixel of the planet in the simulations has about 
-                                                    # 2.38% of the total brightness in the detector.
-
-    flux_fraction_to_detector_planet_sim = 0.896 # Empirically, the flux at the detector in this simulation is about 89.6% of the
-                                        # flux specified in the flux parameter of the wavefront in the simulation when the point source
-                                        # is offset by the offset value used by default here [2.8481e-6, 1.5481e-6].
-
-    input_flux_planet = peak_photons_planet_sim / peak_pixel_to_total_detector_planet_sim / flux_fraction_to_detector_planet_sim
-    
-    flux_1, flux_2 = input_flux_star, input_flux_planet
+    peak_flux_planet =  planet_contrast * photons_normalization / contrast_normalization
+    flux_1, flux_2 = peak_flux_star, peak_flux_planet
 
     # Set up the wavefront objects
     plane_wave_1 = Wavefront(wf_npix, diameter, wavelen, flux_1)
@@ -333,9 +360,12 @@ if __name__ == "__main__":
     est_residual = out - out_1
     est_residual = est_residual.detach().cpu().numpy()
     est_residual_log10 = np.log10(est_residual + vis_norm_eps)
-    est_residual_log10 = (est_residual_log10 - est_residual_log10.min()) / (est_residual_log10.max() - est_residual_log10.min())
-    est_residual_log10 = np.uint8(cm.inferno(est_residual_log10) * 255)
-    imageio.mimsave(f'{vis_dir}/vis_est_residual_gt.mp4', est_residual_log10, 'FFMPEG', **ffmpeg_kargs)
+    est_residual_log10 = est_residual_log10 / est_residual_log10.max()
+    est_residual_log10 = np.uint8(cm.viridis(est_residual_log10) * 255)
+    imageio.imsave(f'{vis_dir}/vis_est_log10_residual_gt.png', est_residual_log10[0])
+    est_residual = est_residual / est_residual.max()
+    est_residual = np.uint8(cm.viridis(est_residual) * 255)
+    imageio.imsave(f'{vis_dir}/vis_residual_gt.png', est_residual[0])
 
     # Find planet location in image pixels
     planet_coords = (offset / psf_pixel_scale) + (psf_npix / 2)
@@ -351,24 +381,36 @@ if __name__ == "__main__":
     begin_x, end_x = planet_coords[0] - 5, planet_coords[0] + 5
     begin_y, end_y = planet_coords[1] - 5, planet_coords[1] + 5
 
-    if args.photon_noise > 0:
-        random_shot_noise = torch.randn_like(out) * torch.sqrt(out) * args.photon_noise
-        out_noisy = out + random_shot_noise
+    if args.shot_noise > 0:
+        shot_noise = torch.normal(mean = out, std = args.shot_noise * torch.sqrt(out)) - out
+        read_noise = torch.normal(mean = 0, std = args.read_noise * torch.ones_like(out))
+        noise = shot_noise + read_noise
+
+        out_noisy = out + noise
         out = torch.clamp(out_noisy, min=0.0)
+        planet = out_2
+        star = out_1
+
+        x = np.array([f'Star: min={star.min()}, max={star.max()}', f'Planet: min={planet.min()}, max={planet.max()}', f'Noise: min={noise.min()}, max={noise.max()}'])
+        np.savetxt(f'{vis_dir}/photon_stats.txt', x, fmt='%s')
+
+        # Visualize subtraction result
+        est_residual = torch.clamp(out - out_1, min=0.0)
+        est_residual = est_residual.detach().cpu().numpy()
+        est_residual_log10 = np.log10(est_residual + vis_norm_eps)
+        est_residual_log10 = est_residual_log10 / est_residual_log10.max()
+        est_residual_log10 = np.uint8(cm.viridis(est_residual_log10) * 255)
+        imageio.imsave(f'{vis_dir}/vis_res_log10_gt_w_noise.png', np.mean(est_residual_log10, axis=0).astype(np.uint8))
+        est_residual = est_residual / est_residual.max()
+        est_residual = np.uint8(cm.viridis(est_residual) * 255)
+        imageio.imsave(f'{vis_dir}/vis_res_gt_w_noise.png', np.mean(est_residual, axis=0).astype(np.uint8))
 
     observations = out.detach().contiguous().to(DEVICE)
     wfe_gt = sampledWFEs
     wfe_delta = sampledWFEs_2 - sampledWFEs
 
-    out_arr = out.numpy()
-    out_arr_log10 = np.log10(out_arr + 1e-10)
-    out_arr_log10 = np.array([(a - a.min()) / (a.max() - a.min()) for a in out_arr_log10])
-    out_log10 = np.uint8(cm.inferno(out_arr_log10) * 255)
-    imageio.mimsave(f'{vis_dir}/vis.mp4', out_log10, 'FFMPEG', **ffmpeg_kargs)
-
     # Add error to the WFE
-    #wfe_off = error_ratio * torch.rand_like(wfe_gt) * wfe_gt.abs()
-    wfe_off = error_ratio * wfe_delta
+    wfe_off = drift_ratio * wfe_delta
     wfe_batch = sampledWFEs + wfe_off
     wfe_batch = wfe_batch.contiguous()
     wfe_batch.requires_grad = True
@@ -381,16 +423,12 @@ if __name__ == "__main__":
             pred_1 = p1_model(plane_wave_1, cur_wfe)
             e_pred.append(pred_1.detach().cpu())
         e_pred = torch.cat(e_pred)
+
     est_residual = torch.relu(out - e_pred)
     est_residual = est_residual.detach().cpu().numpy()
-    est_residual_log10 = np.log10(est_residual + vis_norm_eps)
-    est_residual_log10 = (est_residual_log10 - est_residual_log10.min()) / (est_residual_log10.max() - est_residual_log10.min())
-    est_residual_log10 = np.uint8(cm.inferno(est_residual_log10) * 255)
-    imageio.mimsave(f'{vis_dir}/vis_est_res_log10_init.mp4', est_residual_log10, 'FFMPEG', **ffmpeg_kargs)
-    imageio.imsave(f'{vis_dir}/vis_est_res_log10_init.png', np.mean(est_residual_log10, axis=0)[..., :3].astype(np.uint8))
-    imageio.imsave(f'{vis_dir}/vis_est_res_log10_init_crop.png', np.mean(est_residual_log10, axis=0)[begin_x:end_x, begin_y:end_y, :3].astype(np.uint8))
-
-    imageio.imsave(f'{vis_dir}/vis_measurement.png', np.mean(out_log10, axis=0).astype(np.uint8))
+    est_residual_normed = est_residual / est_residual.max()
+    est_residual_normed = np.uint8(cm.viridis(est_residual_normed) * 255)
+    imageio.imsave(f'{vis_dir}/vis_est_res_init.png', np.mean(est_residual_normed, axis=0).astype(np.uint8))
 
     init_est_star_psf = e_pred.detach().cpu().numpy()
     init_est_residual_psf = est_residual.copy()
@@ -402,16 +440,9 @@ if __name__ == "__main__":
     wfe_err_arr.append(wfe_err.item())
 
     # Set up the optimizer and scheduler
-    optimizer = torch.optim.AdamW([wfe_batch], lr=lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=iters // 1, eta_min=1e-20)
-
-    if args.INR:
-        INR_net = G_Tensor(wfe_batch.shape[-1], wfe_batch.shape[-1], len(wfe_batch))
-        INR_net = INR_net.to(DEVICE)
-        lr = 1e-10
-        optimizer = torch.optim.AdamW(INR_net.parameters(), lr=lr)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=iters, eta_min=1e-20)
-        wfe_obs = wfe_batch.detach()
+    optimizer = torch.optim.Adam([wfe_batch], lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=iters, eta_min=1e-20)
+    loss_scale = init_est_star_psf.max()
 
     if args.log_progress:
         progress_arr = []
@@ -421,23 +452,14 @@ if __name__ == "__main__":
     for i in tbar:
         optimizer.zero_grad()
 
-        if args.INR:
-            INR_out = INR_net()
-            wfe_batch = wfe_obs + INR_out
-
         batch_ids = torch.arange(N)
         cur_wfe = wfe_batch[batch_ids]
         pred_1 = p1_model(plane_wave_1, cur_wfe)
 
-        if args.photon_noise > 0:
-            random_shot_noise = torch.randn_like(pred_1) * torch.sqrt(pred_1) * args.photon_noise
-            pred_1 = pred_1 + random_shot_noise
-            pred_1 = torch.clamp(pred_1, min=0.0)
-
         if args.loss_fn == 'L2':
-            loss = (pred_1 - observations[batch_ids]).pow(2).sum() / (199 ** 2 * 32)
+            loss = (pred_1 - observations[batch_ids]).pow(2).sum() / loss_scale
         else:
-            loss = (pred_1 - observations[batch_ids]).abs().sum() / (199 ** 2 * 32)
+            loss = (pred_1 - observations[batch_ids]).abs().sum() / loss_scale
 
         loss.backward()
         optimizer.step()
@@ -452,41 +474,29 @@ if __name__ == "__main__":
             with torch.no_grad():
                 e_pred = p1_model(plane_wave_1, wfe_batch).detach().cpu()
             est_residual = torch.relu(out - e_pred).detach().cpu().numpy()
-            est_residual_log10 = np.log10(est_residual + vis_norm_eps)
-            est_residual_log10 = (est_residual_log10 - est_residual_log10.min()) / (est_residual_log10.max() - est_residual_log10.min())
-            est_residual_log10 = np.uint8(255 * cm.inferno(est_residual_log10))
-            imageio.mimsave(f'{vis_dir}/vis_est_res_log10_{i}.mp4', est_residual_log10, 'FFMPEG', **ffmpeg_kargs)
+            est_residual = est_residual / est_residual.max()
+            est_residual = np.mean(est_residual, axis=0)
+            est_residual = np.uint8(255 * cm.viridis(est_residual))
+            imageio.imsave(f'{vis_dir}/vis_est_res_{i}.png', est_residual)
+
+        if args.log_progress:
+            cur_est = torch.relu(observations[batch_ids] - pred_1).detach().cpu().numpy()
+            cur_est = cur_est / cur_est.max()
+            cur_est = np.mean(cur_est, axis=0)
+            cur_est = np.uint8(255 * cm.viridis(cur_est))
+            progress_arr.append(cur_est)
         tbar_out = {'loss': e_loss, 'wfe_err': wfe_err.item()}
         tbar.set_postfix(tbar_out)
 
-        if args.log_progress:
-            with torch.no_grad():
-                e_pred = p1_model(plane_wave_1, wfe_batch).detach().cpu()
-            _est_residual = torch.relu(out - e_pred).detach().cpu().numpy()
-            _est_residual_log10 = np.log10(_est_residual + vis_norm_eps)
-            _est_residual_log10 = (_est_residual_log10 - _est_residual_log10.min()) / (_est_residual_log10.max() - _est_residual_log10.min())
-            progress_arr.append(np.mean(_est_residual_log10, axis=0))
-    imageio.imsave(f'{vis_dir}/vis_est_res_log10.png', np.mean(est_residual_log10, axis=0).astype(np.uint8))
-    imageio.imsave(f'{vis_dir}/vis_est_res_log10_crop.png', np.mean(est_residual_log10, axis=0)[begin_x:end_x,  begin_y:end_y].astype(np.uint8))
-
     if args.log_progress:
-        progress_out_dir = f'{vis_dir}/progress'
-        os.makedirs(progress_out_dir, exist_ok=True)
-        for i, img in enumerate(est_residual_log10):
-            imageio.imsave(f'{progress_out_dir}/final_{i}.png', img)
-
         progress_arr = np.stack(progress_arr)
-        progress_arr = np.uint8(255 * cm.inferno(progress_arr))
-        for i, img in enumerate(progress_arr):
-            if i % 5 == 0:
-                imageio.imsave(f'{progress_out_dir}/progress_{i}.png', img)
-        imageio.mimsave(f'{progress_out_dir}/../progress.mp4', progress_arr[::50], 
+        imageio.mimsave(f'{vis_dir}/progress.mp4', progress_arr[::50], 
                         'FFMPEG', **{'macro_block_size': None, 'ffmpeg_params': ['-s','256x256', '-v', '0'], 'fps': 5, })
 
     with torch.no_grad():
         est_star_psf = p1_model(plane_wave_1, wfe_batch).detach().cpu().numpy()
     true_star_psf = out_1.numpy()
-    est_residual_psf = est_residual
+    est_residual_psf = torch.relu(out - est_star_psf).detach().cpu().numpy()
     true_residual_psf = (out - out_1).detach().cpu().numpy()
 
     psnr_init_star = peak_signal_noise_ratio(true_star_psf / true_star_psf.max(), init_est_star_psf / true_star_psf.max(), data_range=1)
