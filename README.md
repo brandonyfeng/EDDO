@@ -1,4 +1,5 @@
-This repository contains the implementation of the differentiable pipeline for exoplanet detection from images taken with the James Webb Space Telescope (JWST) Near Infrared Camera (NIRCam), as described in the paper "Exoplanet Imaging via Differentiable Rendering".
+## EDDO: Exoplanet Detection with Differentiable Optics
+This repository contains the implementation of the differentiable optics pipeline for exoplanet detection from images taken with the James Webb Space Telescope (JWST) Near Infrared Camera (NIRCam), as described in the paper "Exoplanet Imaging via Differentiable Rendering".
 
 ## Example: Real JWST Data - HIP 65426
 The file `run_JWST_broadband_OPDandPosition.py` contains the code to run the simulations. 
