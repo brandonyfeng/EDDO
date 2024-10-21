@@ -1,14 +1,19 @@
-# Exoplanet_DiffSim
+This repository contains the implementation of the differentiable pipeline for exoplanet detection from images taken with the James Webb Space Telescope (JWST) Near Infrared Camera (NIRCam), as described in the paper "Exoplanet Imaging via Differentiable Rendering".
 
-This repository contains the code used to generate the results in the paper "Computational Imaging for Exoplanet Detection via Differentiable Simulation". The code is based on the [PyTorch](https://pytorch.org/) library.
+## Example: Real JWST Data - HIP 65426
+The file `run_JWST_broadband_OPDandPosition.py` contains the code to run the simulations. 
+Example command to process real JWST data will be executed by running:
+```
+./scripts/run.sh
+```
 
-## Simple example
-The file `run_JWST.py` contains the code to run the simulations. The code can be run using the following command:
+## Example: Simple Simulation
+The file `run_JWST.py` contains the code to run the simulations. 
+Example command to perform simulation will be executed by running:
 ```
 ./scripts/run_JWST_test.sh
 ```
-
-## Explanations
+## Simulation Command Option Explanations
 The `--iters` flag sets the number of optimization iterations.
 
 The `--num_t` flag sets the number of measurements (default as 1).

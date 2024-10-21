@@ -291,3 +291,18 @@ def arcsec2rad(values):
     """
     return values * np.pi / (3600 * 180)
 
+def rad2arcsec(values):
+    """
+    Converts the inputs values from radians to arcseconds.
+
+    Parameters
+    ----------
+    values : Array, radians
+        The input values in units of radians to be converted into arcseconds.
+
+    Returns
+    -------
+    values : Array, arcseconds
+        The input values converted into arcseconds.
+    """
+    return values * (3600 * 180) / np.pi
