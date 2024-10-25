@@ -328,8 +328,8 @@ if __name__ == "__main__":
     photons_normalization = 90578.00102527262 * sim_to_real_scaling # mJy/sr
     peak_flux_star  = photons_normalization / contrast_normalization
 
-    offset_STAR = nn.Parameter(torch.FloatTensor([args.star_offset_x * arcsec2rad(psf_pixel_scale), args.star_offset_y * arcsec2rad(psf_pixel_scale)]))
-
+    offset_STAR = nn.Parameter(torch.FloatTensor([args.star_offset_x * arcsec2rad(1 / (psf_pixel_scale * 1000)), args.star_offset_y * arcsec2rad(1 / (psf_pixel_scale * 1000))]))
+    
     # Set up the wavefront objects
     wavefronts_list1 = [Wavefront(wf_npix, diameter, wl, peak_flux_star, offset_STAR).to(DEVICE) for wl in wlen_weights[0]]
 
