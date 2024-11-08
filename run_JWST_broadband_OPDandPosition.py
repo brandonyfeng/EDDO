@@ -5,6 +5,7 @@ import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import cm
+import json
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -15,6 +16,7 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.transforms import v2
 
 from dl_utils import pixel_coords, crop_to, arcsec2rad, partial_MFT
 
@@ -39,6 +41,20 @@ def load_data(data_dir):
     nircam_opd = np.array(nircam_opd)
 
     return aperture, lyot, fpm, nircam_opd, wlens_weights
+
+def load_mirror_segment_info(data_dir):
+    segments_folder = os.path.join(data_dir, 'mirror_segments')
+
+    segments_masks = np.load(os.path.join(segments_folder, 'segment_masks_1024.npy'))
+
+    with open(os.path.join(segments_folder, 'seg_centers_pixels_1024.json'), 'r') as file:
+        segment_centers_pixels = json.load(file)
+    
+    with open(os.path.join(segments_folder, 'segnames_idx.json'), 'r') as file:
+        segment_idx = json.load(file)
+
+    return segments_masks, segment_centers_pixels, segment_idx
+
 
 
 class ShiftModule(nn.Module):
@@ -112,6 +128,14 @@ class OPDOffsetModule(nn.Module):
         out = res + x
         return out
 
+class FluxOffsetModule(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.data = nn.Parameter(torch.ones(1), requires_grad=True)
+
+    def forward(self):
+
+        return self.data
 
 class AngleOffsetModule(nn.Module):
     def __init__(self):
@@ -121,6 +145,57 @@ class AngleOffsetModule(nn.Module):
     def forward(self):
 
         return self.data
+
+class PTT_OPD(nn.Module):
+    """
+    Parametrizes the OPD at the entrance of JWST as Piston-Tip-Tilt of the hexagonal mirror segments
+    """
+    def __init__(self,labelled_transmission,segment_centers, segment_labels,npixels):
+        super().__init__()
+        self.piston_coeffs = nn.Parameter(torch.zeros(18))
+        self.xtilt_coeffs = nn.Parameter(torch.zeros(18))
+        self.ytilt_coeffs = nn.Parameter(torch.zeros(18))
+        # Origin 0,0 at the corner, to match the origin of the segment_centers keyword.
+        # Only used to shift the origin of the Zernikes to the center of each segment
+        coords = np.meshgrid(np.linspace(0.,npixels, npixels), np.linspace(0.,npixels, npixels))
+        self.coords_grid_x = torch.from_numpy(coords[0])[None]
+        self.coords_grid_y = torch.from_numpy(coords[1])[None]
+        self.segment_radius = nn.Parameter((npixels / 5. / 2.) / torch.cos(torch.deg2rad(torch.tensor(30.))), requires_grad=False) # in pixels
+
+        ordered_segment_masks = []
+        ordered_segment_centers = []
+
+        for seg_name, seg_label in segment_labels.items():
+            current_mirror_transmission = np.where(labelled_transmission == seg_label, 1.,0.)
+            # Flip to match orientation of our simulator
+            ordered_segment_masks.append(torch.from_numpy(np.flip(current_mirror_transmission, axis=0).copy())[None])
+
+            # Invert y-axis of center coordinates, to match orientation of our simulator
+            center_x = segment_centers[seg_name][0]
+            center_y =npixels - segment_centers[seg_name][1]
+            ordered_segment_centers.append([center_x, center_y])
+        
+        self.ordered_segment_masks = ordered_segment_masks
+        self.ordered_segment_centers = ordered_segment_centers
+
+    def get_res(self):
+        total_opd = torch.zeros_like(self.coords_grid_x)
+        for i in range(len(self.ordered_segment_masks)):
+            piston_opd = torch.zeros_like(self.ordered_segment_masks[i])+ self.piston_coeffs[i] # simply add constant 
+            r_grid = torch.sqrt((self.coords_grid_x - self.ordered_segment_centers[i][0])**2 + (self.coords_grid_y-self.ordered_segment_centers[i][1])**2)
+            theta_grid = torch.arctan2(self.coords_grid_y-self.ordered_segment_centers[i][1], self.coords_grid_x- self.ordered_segment_centers[i][0])
+
+            xtilt_opd = self.xtilt_coeffs[i] * 2* r_grid * np.cos(theta_grid) / self.segment_radius # Normalize to unit radius
+            ytilt_opd = self.ytilt_coeffs[i] * 2* r_grid * np.sin(theta_grid) / self.segment_radius
+
+            total_opd+=(piston_opd + xtilt_opd + ytilt_opd)* self.ordered_segment_masks[i]
+
+        return total_opd
+    
+    def forward(self, x):
+        res = self.get_res()
+        out = res + x
+        return out
 
 
 class Wavefront(nn.Module):
@@ -217,7 +292,7 @@ class Wavefront(nn.Module):
 
 
 class PointPropagate(nn.Module):
-    def __init__(self, aperture, lyot, fpm, nircam_opd, args):
+    def __init__(self, aperture, lyot, fpm, nircam_opd, args, use_ptt = None):
         super().__init__()
         self.aperture = aperture
         self.lyot = lyot
@@ -227,7 +302,14 @@ class PointPropagate(nn.Module):
         self.lyot_shifts = ShiftModule(lyot.shape[-2], lyot.shape[-1])
         self.fpm_shifts = ShiftModule(fpm.shape[-2], fpm.shape[-1])
         self.nircam_offsets = GridOffsetModule(nircam_opd.shape[-2], nircam_opd.shape[-1])
-        self.wfe_offsets = OPDOffsetModule(fpm.shape[-2], fpm.shape[-1])
+
+        self.flux_correction = FluxOffsetModule()
+
+        if use_ptt is None:
+            self.wfe_offsets = OPDOffsetModule(fpm.shape[-2], fpm.shape[-1])
+        else:
+            self.wfe_offsets = use_ptt
+            
         self.angle_offsets = AngleOffsetModule()
 
         (npixels, wavelengths, true_pixel_scale, psf_npix, psf_pixel_scale, focal_length, shift, pixel, inverse) = args
@@ -264,6 +346,13 @@ class PointPropagate(nn.Module):
 
         output = torch.flip(output, dims=(-2,))
 
+        output = output*self.flux_correction()
+
+        # Valid for NIRCam; right sigma probably depends on filter/detector/etc
+        # Charge diffusion, probably the most significant detector effect at play here
+        # Other detector effects can be added as convolutions with the kernels in the data/detector_kernels folder
+        output = v2.GaussianBlur(kernel_size=3, sigma=0.28)(output)
+
         return output
 
     def forward_val(self, wavefront):
@@ -290,6 +379,7 @@ if __name__ == "__main__":
     parser.add_argument('--lr', default=1e-8, type=float)
     parser.add_argument('--star_offset_x', default=0, help='Initial star offset (in pixel)', type=float)
     parser.add_argument('--star_offset_y', default=0, help='Initial star offset (in pixel)', type=float)
+    parser.add_argument('--use_ptt', action='store_true')
     args = parser.parse_args()
 
     DEVICE = 'cuda'
@@ -305,7 +395,8 @@ if __name__ == "__main__":
 
     # Load data from args.data_dir
     aperture, lyot, fpm, nircam_OPD, wlen_weights = load_data(data_dir=args.data_dir)
-
+        
+     
     aperture = torch.FloatTensor(aperture.copy()).to(DEVICE)[None]
     nircam_OPD = torch.tensor(nircam_OPD, dtype=torch.float64).to(DEVICE)[None]
     lyot = torch.FloatTensor(lyot).to(DEVICE)[None]
@@ -344,7 +435,12 @@ if __name__ == "__main__":
     prop_args = (npixels, wlen_weights[0], true_pixel_scale, psf_npix, psf_pixel_scale, focal_length, shift, pixel, inverse)
 
     # Set up the propagation object
-    prop_models = [PointPropagate(aperture, lyot, fpm, nircam_OPD, prop_args).to(DEVICE) for _ in range(1)]
+    if args.use_ptt:
+        labelled_transmission,segment_centers, segment_labels = load_mirror_segment_info(data_dir=args.data_dir)
+        entrance_OPD_PTT = PTT_OPD(labelled_transmission,segment_centers, segment_labels,wf_npix)
+        prop_models = [PointPropagate(aperture, lyot, fpm, nircam_OPD, prop_args, use_ptt=entrance_OPD_PTT).to(DEVICE) for _ in range(1)]
+    else:
+        prop_models = [PointPropagate(aperture, lyot, fpm, nircam_OPD, prop_args).to(DEVICE) for _ in range(1)]
 
     real_im = np.load(f'{args.data_dir}/real_data/{args.measurement_file}')[:1, 120:200, 120:200]
     plt.imsave(f'{vis_dir}/vis_measurement.png', real_im[0], cmap='viridis', origin='lower')
@@ -373,8 +469,10 @@ if __name__ == "__main__":
     nircam_offsets: learns to offset the nircam opd
     """
     for p_model in prop_models:
-        #optics_params += list(p_model.angle_offsets.parameters()) + list(p_model.nircam_offsets.parameters()) + list(p_model.wfe_offsets.parameters())
-        optics_params += list(p_model.angle_offsets.parameters()) + list(p_model.nircam_offsets.parameters())
+        if args.use_ptt:
+            optics_params += list(p_model.angle_offsets.parameters()) + list(p_model.nircam_offsets.parameters()) + list(p_model.wfe_offsets.parameters())
+        else:
+            optics_params += list(p_model.angle_offsets.parameters()) + list(p_model.nircam_offsets.parameters())
 
     optimizer = torch.optim.AdamW(optics_params, lr=args.lr, weight_decay=0.0)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.iters, eta_min=args.lr)
@@ -424,6 +522,7 @@ if __name__ == "__main__":
     progress_arr = np.flip(progress_arr, 1)
     imageio.mimsave(f'{vis_dir}/progress.mp4', progress_arr, 
                     'FFMPEG', **{'macro_block_size': None, 'ffmpeg_params': ['-s','256x256', '-v', '0'], 'fps': 30, })
+
 
     opd_vis_arr = torch.stack(opd_vis_arr)[::5]
     opd_vis_arr = (opd_vis_arr - opd_vis_arr[0:1]).abs().numpy()
