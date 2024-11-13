@@ -158,8 +158,8 @@ class PTT_OPD(nn.Module):
         # Origin 0,0 at the corner, to match the origin of the segment_centers keyword.
         # Only used to shift the origin of the Zernikes to the center of each segment
         coords = np.meshgrid(np.linspace(0.,npixels, npixels), np.linspace(0.,npixels, npixels))
-        self.coords_grid_x = torch.from_numpy(coords[0])[None]
-        self.coords_grid_y = torch.from_numpy(coords[1])[None]
+        self.coords_grid_x = torch.from_numpy(coords[0]).to(DEVICE)[None]
+        self.coords_grid_y = torch.from_numpy(coords[1]).to(DEVICE)[None]
         self.segment_radius = nn.Parameter((npixels / 5. / 2.) / torch.cos(torch.deg2rad(torch.tensor(30.))), requires_grad=False) # in pixels
 
         ordered_segment_masks = []
@@ -175,8 +175,8 @@ class PTT_OPD(nn.Module):
             center_y =npixels - segment_centers[seg_name][1]
             ordered_segment_centers.append([center_x, center_y])
         
-        self.ordered_segment_masks = ordered_segment_masks
-        self.ordered_segment_centers = ordered_segment_centers
+        self.ordered_segment_masks = torch.stack(ordered_segment_masks).to(DEVICE)
+        self.ordered_segment_centers = torch.tensor(ordered_segment_centers, dtype=torch.float64).to(DEVICE)
 
     def get_res(self):
         total_opd = torch.zeros_like(self.coords_grid_x)
@@ -185,8 +185,8 @@ class PTT_OPD(nn.Module):
             r_grid = torch.sqrt((self.coords_grid_x - self.ordered_segment_centers[i][0])**2 + (self.coords_grid_y-self.ordered_segment_centers[i][1])**2)
             theta_grid = torch.arctan2(self.coords_grid_y-self.ordered_segment_centers[i][1], self.coords_grid_x- self.ordered_segment_centers[i][0])
 
-            xtilt_opd = self.xtilt_coeffs[i] * 2* r_grid * np.cos(theta_grid) / self.segment_radius # Normalize to unit radius
-            ytilt_opd = self.ytilt_coeffs[i] * 2* r_grid * np.sin(theta_grid) / self.segment_radius
+            xtilt_opd = self.xtilt_coeffs[i] * 2* r_grid * torch.cos(theta_grid) / self.segment_radius # Normalize to unit radius
+            ytilt_opd = self.ytilt_coeffs[i] * 2* r_grid * torch.sin(theta_grid) / self.segment_radius
 
             total_opd+=(piston_opd + xtilt_opd + ytilt_opd)* self.ordered_segment_masks[i]
 
@@ -306,7 +306,7 @@ class PointPropagate(nn.Module):
         self.flux_correction = FluxOffsetModule()
 
         if use_ptt is None:
-            self.wfe_offsets = OPDOffsetModule(fpm.shape[-2], fpm.shape[-1])
+            self.wfe_offsets = OPDOffsetModule(nircam_opd.shape[-2], nircam_opd.shape[-1])
         else:
             self.wfe_offsets = use_ptt
             
@@ -437,7 +437,7 @@ if __name__ == "__main__":
     # Set up the propagation object
     if args.use_ptt:
         labelled_transmission,segment_centers, segment_labels = load_mirror_segment_info(data_dir=args.data_dir)
-        entrance_OPD_PTT = PTT_OPD(labelled_transmission,segment_centers, segment_labels,wf_npix)
+        entrance_OPD_PTT = PTT_OPD(labelled_transmission,segment_centers, segment_labels,wf_npix).to(DEVICE)
         prop_models = [PointPropagate(aperture, lyot, fpm, nircam_OPD, prop_args, use_ptt=entrance_OPD_PTT).to(DEVICE) for _ in range(1)]
     else:
         prop_models = [PointPropagate(aperture, lyot, fpm, nircam_OPD, prop_args).to(DEVICE) for _ in range(1)]
