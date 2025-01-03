@@ -65,7 +65,7 @@
             <div class="is-size-5 publication-authors">
               <span class="author-block">
                 <small>
-                  Preprint
+                  IEEE Transactions on Computational Imaging, 2024
                 </small>
               </span> 
             </div>
@@ -91,21 +91,12 @@
                   </a>
                 </span>
                 <span class="link-block">
-                  <a href="https://github.com/3d-motion-magnification/3d-motion-mag"
+                  <a href="https://github.com/brandonyfeng/EDDO"
                      class="external-link button is-normal is-rounded is-dark">
                     <span class="icon">
                         <i class="fab fa-github"></i>
                     </span>
                     <span>Code</span>
-                    </a>
-                </span>
-                <span class="link-block">
-                  <a href="#BibTeX"
-                     class="external-link button is-normal is-rounded is-dark">
-                    <span class="icon">
-                        <i class="fas fa-book"></i>
-                    </span>
-                    <span>BibTex</span>
                     </a>
                 </span>
               </div>
@@ -137,14 +128,10 @@
               Wavefront aberrations introduce speckles in the telescope science images, which are patterns of diffracted starlight that can mimic the appearance of planets, complicating the detection of faint exoplanet signals. 
               Traditional post-processing methods, operating primarily in the image intensity domain, do not integrate wavefront sensing data.
               These data, measured mainly for adaptive optics corrections, have been overlooked as a potential resource for post-processing, partly due to the challenge of the evolving nature of wavefront aberrations.
-              We present a novel approach that shifts the paradigm from image intensity space to wave space.
-              This perspective not only allows us to repurpose wavefront sensing data but also provides a more comprehensive framework for addressing the challenges of high-contrast imaging. 
-              Our method leverages a differentiable renderer that models wave-based light propagation through a coronagraphic telescope system, allowing gradient-based optimization to significantly improve starlight subtraction and increase sensitivity to faint exoplanets. 
-              Simulation experiments based on the James Webb Space Telescope configuration demonstrate the effectiveness of our approach, showcasing substantial improvements in contrast and planet detection limits. 
-              Our approach paves the way for a new generation of post-processing algorithms that operate from a wave space perspective, revitalizing previously underexploited wavefront data and opening up new avenues for advancing the frontiers of exoplanet detection and characterization.            </p>
-          <!--<div align="center"><iframe width="560" height="315" src="https://www.youtube.com/embed/ljar4GAFkUk" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe></div>-->
-          </div>
-
+              In this paper, we present a differentiable rendering approach that leverages these wavefront sensing data to improve exoplanet detection.
+              Our differentiable renderer models wave-based light propagation through a coronagraphic telescope system, allowing gradient-based optimization to significantly improve starlight subtraction and increase sensitivity to faint exoplanets. 
+              Simulation experiments based on the James Webb Space Telescope configuration demonstrate the effectiveness of our approach, achieving substantial improvements in contrast and planet detection limits. 
+              Our results showcase how the computational advancements enabled by differentiable rendering can revitalize previously underexploited wavefront data, opening new avenues for enhancing exoplanet imaging and characterization.          </div>
           <h2 class="title is-3">Toy Example of the Imaging Problem</h2>
           <img src="./static/images/1D_toy.png" alt="overview" width="80%">
           <div class="content has-text-justified">
@@ -265,39 +252,11 @@
               The rise in the contrast limit in the KLIP curve at $\sim$ 2 arcseconds is due to artifacts in the image subtraction from using reference images near the size of the stellar PSF and with a relative shift from one another (see Supplement).
             </p>
           </div>
-
-
-
         </div>
     </div>
   </section>
   <br>
 
-
-
-  <section class="section" id="BibTeX">
-    <div class="container is-max-desktop content">
-      <h2 class="title">BibTeX</h2>
-      <pre><code>@article{feng2024exo,
-        author    = {Feng, Brandon Y. and Ferrer-Ch\'{a}vez, Rodrigo and Levis, Aviad and Wang, Jason J. and Bouman, Katherine L. and Freeman, William T.},
-        title     = {Exoplanet Detection via Differentiable Rendering},
-        journal   = {IEEE Transactions on Computational Imaging},
-        year      = {2024},
-      }</code></pre>
-    </div>
-  </section>  
-  <br>
-  <div class="columns is-centered has-text-right">
-    <div class="column is-8">
-      <div class="content">
-        <p>
-          <small><small>
-            Template from <a href="https://nerfies.github.io/">Nerfies</a>
-          </small></small>
-        </p>
-      </div>
-    </div>
-  </div>
 
 </body>
 </html>
