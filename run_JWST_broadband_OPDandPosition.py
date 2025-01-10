@@ -122,11 +122,59 @@ class AngleOffsetModule(nn.Module):
 
         return self.data
 
+class Zernike(nn.Module):
+    def __init__(self, n_max: int, m_max: int, npixels: int):
+        super().__init__()
+        self.n_max = n_max
+        self.m_max = m_max
+        self.npixels = npixels
+        number_of_zernikes = (n_max + 1) * (n_max + 2) // 2
+        self.basis_function_weights = nn.Parameter(torch.randn(number_of_zernikes, dtype=torch.float64), requires_grad=True)
+        self.center_x = nn.Parameter(torch.tensor(npixels / 2, dtype=torch.float64), requires_grad=False)
+        self.center_y = nn.Parameter(torch.tensor(npixels / 2, dtype=torch.float64), requires_grad=False)
+
+    def _factorial(x: torch.Tensor) -> torch.Tensor:
+        return torch.lgamma(x + 1).exp()
+
+    def _f_nms(self, n: int, m: int, s: int, rho: torch.Tensor) -> torch.Tensor:
+        return (-1) ** s * self._factorial(n-s) * self._factorial((n-m)/2 - s)) * rho ** (n - 2 * s) / (self._factorial(s) * self._factorial((n+m)/2 - s) 
+
+    def _summation(self, n: int, m: int, rho: torch.Tensor) -> torch.Tensor:
+        indices_s = torch.arange(0, (n - m)/2, dtype=torch.float64)
+        return torch.sum(self._f_nms(n, m, indices_s, rho))
+
+    def _R_nm(self, n: int, m: int, rho: torch.Tensor, npixels: int) -> torch.Tensor:
+        radial_contribution = torch.zeros_like((npixels, npixels), dtype=torch.float64)
+        radial_contribution += self._summation(n, m, rho)
+        return radial_contribution
+
+    def sum_basis_funcs(self):
+        x = torch.linspace(0, self.npixels - 1, self.npixels, dtype=torch.float64)
+        y = torch.linspace(0, self.npixels - 1, self.npixels, dtype=torch.float64)
+        x, y = torch.meshgrid(x, y)
+        x = x - self.center_x
+        y = y - self.center_y
+        rho = torch.sqrt(x ** 2 + y ** 2)
+        theta = torch.atan2(y, x)
+        idx = 0
+        output = torch.zeros_like((self.npixels, self.npixels), dtype=torch
+        for n in range(self.n_max + 1):
+            for m in range(self.m_max + 1):
+                if m == 0:
+                    output = self.basis_function_weights[idx] * self._R_nm(n, m, rho, self.npixels) * torch.sqrt(n + 1)
+                    idx += 1
+                else if m % 2 == 0:
+                    output = self.basis_function_weights[idx] * self._R_nm(n, m, rho, self.npixels) * torch.cos(m * theta) * torch.sqrt(2 * (n + 1))
+                    idx += 1
+                else:
+                    output = self.basis_function_weights[idx] * self._R_nm(n, m, rho, self.npixels) * torch.sin(m * theta) * torch.sqrt(2 * (n + 1))
+                    idx += 1
+        return zernike
 
 class Wavefront(nn.Module):
-    def __init__(self, npixels: int, diameter: float, wavelength: float, peak_flux: float, angles = None):
+    def __init__(self, npixels: int, diameter: float, wavelength: float, peak_flux: float, angles = None, basis=None):
         super().__init__()
-        self.wavelength = nn.Parameter(wavelength, requires_grad=False)
+        self.wavelength = nn.Parameter(torch.from_numpy(np.asarray(wavelength, float)), requires_grad=False)
         self.pixel_scale = nn.Parameter(torch.from_numpy(np.asarray(diameter / npixels, float)), requires_grad=False)
         self.wavenumber = 2 * np.pi / self.wavelength
         self.npixels = npixels
@@ -135,19 +183,25 @@ class Wavefront(nn.Module):
         self.coordinates = nn.Parameter(pixel_coords(self.npixels, self.diameter), requires_grad=False)
         if angles is None:
             angles = torch.zeros(2)
-        self.angles = nn.Parameter(angles)
+        self.angles = nn.Parameter(angles, requires_grad=True)
+        self.basis = basis
         self.reset()
-
+    
     def reset(self):
         if hasattr(self, 'amplitude'):
             self.amplitude.data = torch.ones_like(self.amplitude.data) / self.npixels**1
             self.phase.data = torch.zeros_like(self.phase.data)
         else:
-            self.amplitude = nn.Parameter(torch.ones((1, self.npixels, self.npixels), dtype=torch.float64) / self.npixels**1)
+            if basis is not None:
+                self.amplitude = self.basis.sum_basis_funcs()
+            else:
+                self.amplitude = nn.Parameter(torch.ones((1, self.npixels, self.npixels), dtype=torch.float64) / self.npixels**1)
             self.phase = nn.Parameter(torch.zeros((1, self.npixels, self.npixels), dtype=torch.float64))
 
     def get_phasor(self, angles_offset=None):
         opd = self.get_tilt_opd(angles_offset)
+        if self.basis is not None:
+            self.amplitude = self.basis.sum_basis_funcs()
         return self.amplitude * torch.exp(1j * (self.phase + opd))
 
     def get_tilt_opd(self, angles_offset=None):
@@ -331,7 +385,7 @@ if __name__ == "__main__":
     offset_STAR = nn.Parameter(torch.FloatTensor([args.star_offset_x * arcsec2rad(1 / (psf_pixel_scale * 1000)), args.star_offset_y * arcsec2rad(1 / (psf_pixel_scale * 1000))]))
     
     # Set up the wavefront objects
-    wavefronts_list1 = [Wavefront(wf_npix, diameter, wl, peak_flux_star, offset_STAR).to(DEVICE) for wl in wlen_weights[0]]
+    wavefronts_list1 = [Wavefront(wf_npix, diameter, wl, peak_flux_star, offset_STAR, basis=Zernike(20, 10, wf_npix)).to(DEVICE) for wl in wlen_weights[0]]
 
     # Set up the propagation model parameters
     shift = [0.0, 0.0]
