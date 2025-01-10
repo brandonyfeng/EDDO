@@ -130,6 +130,8 @@ class Wavefront(nn.Module):
                                 
 
     def get_phasor(self):
+        if self.basis is not None:
+            self.amplitude = self.basis.sum_basis_funcs()
         opd = self.get_tilt_opd()
         return self.amplitude * torch.exp(1j * (self.phase + opd))
 
@@ -382,9 +384,9 @@ if __name__ == "__main__":
     flux_1, flux_2 = peak_flux_star, peak_flux_planet
 
     # Set up the wavefront objects
-    plane_wave_1 = Wavefront(wf_npix, diameter, wavelen, flux_1)
+    plane_wave_1 = Wavefront(wf_npix, diameter, wavelen, flux_1, basis=Zernike(20, 10, wf_npix))
     plane_wave_1 = plane_wave_1.to(DEVICE)
-    plane_wave_2 = Wavefront(wf_npix, diameter, wavelen, flux_2, offset)
+    plane_wave_2 = Wavefront(wf_npix, diameter, wavelen, flux_2, offset, basis=Zernike(20, 10, wf_npix))
     plane_wave_2 = plane_wave_2.to(DEVICE)
 
     # Set up the propagation model parameters
