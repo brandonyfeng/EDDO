@@ -5,6 +5,49 @@ import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import cm
+from poppy.zernike import zernike_basis
+from matplotlib import rcParams, rc
+from matplotlib.gridspec import GridSpec
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+def set_rc_params(fontsize=None):
+    '''
+    Set figure parameters
+    '''
+
+    if fontsize is None:
+        fontsize=16
+    else:
+        fontsize=int(fontsize)
+
+    rc('font',**{'family':'serif'})
+    #rc('text', usetex=True)
+
+    #plt.rcParams.update({'figure.facecolor':'w'})
+    plt.rcParams.update({'axes.linewidth': 1.3})
+    plt.rcParams.update({'xtick.labelsize': fontsize})
+    plt.rcParams.update({'ytick.labelsize': fontsize})
+    plt.rcParams.update({'xtick.major.size': 8})
+    plt.rcParams.update({'xtick.major.width': 1.3})
+    plt.rcParams.update({'xtick.minor.visible': True})
+    plt.rcParams.update({'xtick.minor.width': 1.})
+    plt.rcParams.update({'xtick.minor.size': 6})
+    plt.rcParams.update({'xtick.direction': 'out'})
+    plt.rcParams.update({'ytick.major.width': 1.3})
+    plt.rcParams.update({'ytick.major.size': 8})
+    plt.rcParams.update({'ytick.minor.visible': True})
+    plt.rcParams.update({'ytick.minor.width': 1.})
+    plt.rcParams.update({'ytick.minor.size':6})
+    plt.rcParams.update({'ytick.direction':'out'})
+    plt.rcParams.update({'axes.labelsize': fontsize})
+    plt.rcParams.update({'axes.titlesize': fontsize})
+    plt.rcParams.update({'legend.fontsize': int(fontsize-2)})
+    #plt.rcParams['text.usetex'] = True
+    #plt.rcParams['text.latex.preamble'] = r'\usepackage{amssymb}'
+
+    return
+
+set_rc_params(fontsize=28)
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -174,6 +217,7 @@ class Zernike(nn.Module):
 
         idx = 0
         output = torch.zeros((self.npixels, self.npixels), dtype=torch.float64,device=device)
+        ones = torch.ones((self.npixels, self.npixels), dtype=torch.float64, device=device)
 
         for n in range(self.n_max + 1):
             for m in range(n + 1):
@@ -201,8 +245,10 @@ class Zernike(nn.Module):
                             * torch.sqrt(torch.tensor(2*(n + 1), dtype=torch.float32, device=output.device))
                         )
                         idx += 1
-
-        return output
+        
+        rescaled = output + ones
+        normalization_constant = torch.max(rescaled)
+        return rescaled / normalization_constant
 
 class Wavefront(nn.Module):
     def __init__(self, npixels: int, diameter: float, wavelength: float, peak_flux: float, angles = None, basis=None):
@@ -418,7 +464,7 @@ if __name__ == "__main__":
     offset_STAR = nn.Parameter(torch.FloatTensor([args.star_offset_x * arcsec2rad(1 / (psf_pixel_scale * 1000)), args.star_offset_y * arcsec2rad(1 / (psf_pixel_scale * 1000))]))
     
     # Set up the wavefront objects
-    wavefronts_list1 = [Wavefront(wf_npix, diameter, wl, peak_flux_star, offset_STAR, basis=Zernike(20, 10, wf_npix)).to(DEVICE) for wl in wlen_weights[0]]
+    wavefronts_list1 = [Wavefront(wf_npix, diameter, wl, peak_flux_star, offset_STAR).to(DEVICE) for wl in wlen_weights[0]]
 
     # Set up the propagation model parameters
     shift = [0.0, 0.0]
@@ -443,6 +489,12 @@ if __name__ == "__main__":
         pred = torch.mean(torch.cat(pred, 0), 0)
     pred_np = pred.cpu().numpy()
     plt.imsave(f'{vis_dir}/vis_PSF_render_init.png', pred_np, cmap='viridis', origin='lower')
+
+    z_score_measurement = (real_im[0] - real_im[0].mean()) / real_im[0].std()
+    plt.imsave(f'{vis_dir}/vis_measurement_zscore.png', z_score_measurement, cmap='viridis', origin='lower')
+
+    z_score_pred = (pred_np - pred_np.mean()) / pred_np.std()
+    plt.imsave(f'{vis_dir}/vis_PSF_render_zscore_init.png', z_score_pred, cmap='viridis', origin='lower')
 
     # scale by median before subtraction
     obs_scaled = observations / observations.median()
@@ -474,6 +526,7 @@ if __name__ == "__main__":
     progress_arr = []
     opd_vis_arr = []
     residual_max_arr = []
+    zscore_arr = []
 
     tbar = tqdm.tqdm(range(args.iters + 1))
     for i in tbar:
@@ -481,6 +534,8 @@ if __name__ == "__main__":
 
         pred_1 = [p_model(wavefronts_list1, wfe_batch, wlen_weights[1], wlen_weights[0]) for p_model in prop_models]
         pred_1 = torch.mean(torch.cat(pred_1, 0), 0)[None]
+        z_score_pred = (pred_1.cpu().detach().numpy() - pred_1.cpu().detach().numpy().mean()) / pred_1.cpu().detach().numpy().std()
+        zscore_arr.append(z_score_pred)
 
         # compute loss in median-scaled space
         pred_scaled = pred_1 / pred_1.detach().median()
@@ -511,6 +566,60 @@ if __name__ == "__main__":
     progress_arr = np.flip(progress_arr, 1)
     imageio.mimsave(f'{vis_dir}/progress.mp4', progress_arr, 
                     'FFMPEG', **{'macro_block_size': None, 'ffmpeg_params': ['-s','256x256', '-v', '0'], 'fps': 30, })
+
+    zscore_arr = np.array(zscore_arr)
+    final_zscore = zscore_arr[-1]
+    plt.imsave(f'{vis_dir}/final_zscore_psf.png', final_zscore[0], cmap='viridis', origin='lower')
+
+    nterms = 30
+    npix = psf_npix
+    outside = np.nan 
+    basis = zernike_basis(nterms=nterms, npix=npix, outside=outside)
+    z_weights_real = []
+    z_weights_psf = []
+    for i, zernike_mode in enumerate(basis, start=1):
+        zernike_nan_to_zero = np.nan_to_num(zernike_mode)
+        z_weight_real = (np.nansum(zernike_nan_to_zero * z_score_measurement) / np.nansum(zernike_nan_to_zero * zernike_nan_to_zero))
+        z_weight_psf = (np.nansum(zernike_nan_to_zero * final_zscore) / np.nansum(zernike_nan_to_zero * zernike_nan_to_zero))
+        z_weights_real.append(z_weight_real)
+        z_weights_psf.append(z_weight_psf)
+
+        real_projection = z_weight_real * zernike_mode
+        psf_projection = z_weight_psf * zernike_mode
+
+        fig, ax = plt.subplots(1, 3, sharey=True, figsize=(15, 5), tight_layout=True)
+        vmin = min(np.nanmin(real_projection), np.nanmin(psf_projection))
+        vmax = max(np.nanmax(real_projection), np.nanmax(psf_projection))
+        real_image = ax[0].imshow(real_projection, cmap='viridis', origin='lower', vmin=vmin, vmax=vmax)
+        divider = make_axes_locatable(ax[0])
+        cax = divider.append_axes("right", size="5%", pad=0.05)
+        ax[0].set_title(f'Real Projection {i}')
+        colorbar_one = fig.colorbar(real_image, cax=cax)
+        psf_image = ax[1].imshow(psf_projection, cmap='viridis', origin='lower', vmin=vmin, vmax=vmax)
+
+        divider = make_axes_locatable(ax[1])
+        cax = divider.append_axes("right", size="5%", pad=0.05)
+        ax[1].set_title(f'PSF Projection {i}')
+        colorbar_two = fig.colorbar(psf_image, cax=cax)
+        diff_image = ax[2].imshow(real_projection - psf_projection, cmap='viridis', origin='lower')
+
+        divider = make_axes_locatable(ax[2])
+        cax = divider.append_axes("right", size="5%", pad=0.05)
+        ax[2].set_title('Difference')
+        colorbar_three = fig.colorbar(diff_image, cax=cax)
+        plt.savefig(f'{vis_dir}/final_zscore_projection_{i}.png')
+        plt.close()
+
+    plt.figure(figsize=(18, 10))
+    plt.plot(z_weights_real, label='Real')
+    plt.plot(z_weights_psf, label='PSF')
+    plt.plot(np.array(z_weights_real) - np.array(z_weights_psf), label='Diff')
+    plt.plot(np.zeros(len(z_weights_real)), 'k--')
+    plt.xlabel('Zernike Mode')
+    plt.ylabel('Weight')
+    plt.legend()
+    plt.savefig(f'{vis_dir}/zernike_weights.png')
+    plt.close()
 
     opd_vis_arr = torch.stack(opd_vis_arr)[::5]
     opd_vis_arr = (opd_vis_arr - opd_vis_arr[0:1]).abs().numpy()
