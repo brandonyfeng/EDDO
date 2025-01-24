@@ -166,37 +166,38 @@ class AngleOffsetModule(nn.Module):
         return self.data
 
 class ZernikeNet(nn.Module):
-        def __init__(self, PSF_size, hidden_dim=128, phs_layers=2):
+        def __init__(self, PSF_size, hidden_dim=128, bsize=8, phs_layers=2):
+            super(ZernikeNet, self).__init__()
             self.PSF_size = PSF_size
             self.basis = nn.Parameter(compute_zernike_basis(
                 num_polynomials=28,
                 field_res=(PSF_size, PSF_size)).permute(1, 2, 0).unsqueeze(0).repeat(bsize, 1, 1, 1),
                 requires_grad=False)
 
-        hidden_dim = hidden_dim
-        in_dim = self.basis.shape[-1]
+            hidden_dim = hidden_dim
+            in_dim = self.basis.shape[-1]
 
-        act_fn = nn.LeakyReLU(inplace=True)
-        layers = []
-        layers.append(nn.Linear(in_dim, hidden_dim))
-        for _ in range(phs_layers):
-            layers.append(nn.Linear(hidden_dim, hidden_dim))
-            layers.append(nn.LayerNorm(hidden_dim))
-            layers.append(act_fn)
+            act_fn = nn.LeakyReLU(inplace=True)
+            layers = []
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            for _ in range(phs_layers):
+                layers.append(nn.Linear(hidden_dim, hidden_dim))
+                layers.append(nn.LayerNorm(hidden_dim))
+                layers.append(act_fn)
 
-        layers.append(nn.Linear(hidden_dim, 1))
-        self.wavefront = nn.Sequential(*layers)
+            layers.append(nn.Linear(hidden_dim, 1))
+            self.wavefront = nn.Sequential(*layers)
 
-
-    def forward(self, x, y):
-        x = x.long()
-        y = y.long()
-        basis = self.basis
-        batch_size = x.shape[0]
-        basis_at_coordinate = self.basis[torch.arange(batch_size), y, x]
-        basis_at_coordinate = basis[y, x]
-
-        return self.wavefront(basis_at_coordinate)
+        def forward(self, x, y):
+            x = x.long()
+            y = y.long()
+            basis = self.basis
+            batch_size = x.shape[0]
+            arange_batch = torch.arange(batch_size, device=x.device).unsqueeze(-1)  
+            if x.ndim > 1:  
+                arange_batch = arange_batch.expand_as(x)  
+            basis_at_coordinate = self.basis[arange_batch, y, x]
+            return self.wavefront(basis_at_coordinate)
 
 
 class Wavefront(nn.Module):
@@ -222,11 +223,10 @@ class Wavefront(nn.Module):
         else:
             if self.basis is not None:
                 self.amplitude = torch.zeros(self.npixels, self.npixels, device=self.coordinates.device)
-                input_coordinates_x = self.coordinates[:, 0]
-                input_coordinates_y = self.coordinates[:, 1]
-                for i in range(self.npixels):
-                    for j in range(self.npixels):
-                        self.amplitude[i, j] = self.basis(self.coordinates[i, j, 0].unsqueeze(0), self.coordinates[i, j, 1].unsqueeze(0))
+                coords_x = self.coordinates[:, :, 0].long()
+                coords_y = self.coordinates[:, :, 1].long()
+                self.amplitude = self.basis(coords_x, coords_y)
+                self.amplitude = self.amplitude.unsqueeze(0)
             else:
                 self.amplitude = nn.Parameter(torch.ones((1, self.npixels, self.npixels), dtype=torch.float64) / self.npixels**1)
             self.phase = nn.Parameter(torch.zeros((1, self.npixels, self.npixels), dtype=torch.float64))
@@ -234,11 +234,10 @@ class Wavefront(nn.Module):
     def get_phasor(self, angles_offset=None):
         opd = self.get_tilt_opd(angles_offset)
         if self.basis is not None:
-            input_coordinates_x = self.coordinates[:, 0]
-            input_coordinates_y = self.coordinates[:, 1]
-            for i in range(self.npixels):
-                for j in range(self.npixels):
-                    self.amplitude[i, j] = self.basis(self.coordinates[i, j, 0].unsqueeze(0), self.coordinates[i, j, 1].unsqueeze(0))
+            input_coordinates_x = self.coordinates[:, 0].long()
+            input_coordinates_y = self.coordinates[:, 1].long()
+            self.amplitude = self.basis(input_coordinates_x, input_coordinates_y)
+            self.amplitude = self.amplitude.unsqueeze(0)
         return self.amplitude * torch.exp(1j * (self.phase + opd))
 
     def get_tilt_opd(self, angles_offset=None):
@@ -422,7 +421,7 @@ if __name__ == "__main__":
     offset_STAR = nn.Parameter(torch.FloatTensor([args.star_offset_x * arcsec2rad(1 / (psf_pixel_scale * 1000)), args.star_offset_y * arcsec2rad(1 / (psf_pixel_scale * 1000))]))
     
     # Set up the wavefront objects
-    wavefronts_list1 = [Wavefront(wf_npix, diameter, wl, peak_flux_star, offset_STAR, basis=ZernikeNet(psf_npix)) for wl in wlen_weights[0]]).to(DEVICE)
+    wavefronts_list1 = [Wavefront(wf_npix, diameter, wl, peak_flux_star, offset_STAR, basis=ZernikeNet(psf_npix)).to(DEVICE) for wl in wlen_weights[0]]
 
     # Set up the propagation model parameters
     shift = [0.0, 0.0]
