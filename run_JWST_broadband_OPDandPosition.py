@@ -59,7 +59,7 @@ torch.backends.cudnn.benchmark = False
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dl_utils import pixel_coords, crop_to, arcsec2rad, partial_MFT
+from dl_utils import pixel_coords, crop_to, arcsec2rad, partial_MFT, crop_image, compute_zernike_basis
 
 
 def load_data(data_dir):
@@ -165,90 +165,39 @@ class AngleOffsetModule(nn.Module):
 
         return self.data
 
-class Zernike(nn.Module):
-    def __init__(self, n_max: int, m_max: int, npixels: int):
-        super().__init__()
-        self.n_max = n_max
-        self.m_max = m_max
-        self.npixels = npixels
-        number_of_zernikes = (n_max + 1) * (n_max + 2) // 2
-        self.basis_function_weights = nn.Parameter(
-            torch.randn(number_of_zernikes, dtype=torch.float64), requires_grad=True
-        )
-        self.center_x = nn.Parameter(
-            torch.tensor(npixels / 2, dtype=torch.float64), requires_grad=False
-        )
-        self.center_y = nn.Parameter(
-            torch.tensor(npixels / 2, dtype=torch.float64), requires_grad=False
-        )
+class ZernikeNet(nn.Module):
+        def __init__(self, PSF_size, hidden_dim=128, phs_layers=2):
+            self.PSF_size = PSF_size
+            self.basis = nn.Parameter(compute_zernike_basis(
+                num_polynomials=28,
+                field_res=(PSF_size, PSF_size)).permute(1, 2, 0).unsqueeze(0).repeat(bsize, 1, 1, 1),
+                requires_grad=False)
 
-    @staticmethod
-    def _factorial(x: torch.Tensor) -> torch.Tensor:
-        return torch.lgamma(x + 1).exp()
+        hidden_dim = hidden_dim
+        in_dim = self.basis.shape[-1]
 
-    def _f_nms(self, n: int, m: int, s: torch.Tensor, rho: torch.Tensor) -> torch.Tensor:
-        s_3d = s.view(-1, 1, 1)
-        return (
-            (-1) ** s_3d
-            * self._factorial(n - s_3d)
-            * self._factorial((n - m) / 2 - s_3d)
-            * rho ** (n - 2 * s_3d)
-            / (self._factorial(s_3d) * self._factorial((n + m) / 2 - s_3d))
-        )
+        act_fn = nn.LeakyReLU(inplace=True)
+        layers = []
+        layers.append(nn.Linear(in_dim, hidden_dim))
+        for _ in range(phs_layers):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(act_fn)
 
-    def _summation(self, n: int, m: int, rho: torch.Tensor) -> torch.Tensor:
-        indices_s = torch.arange(0, (n - m) / 2, dtype=torch.float64, device=rho.device)
-        return self._f_nms(n, m, indices_s, rho).sum(dim=0)
+        layers.append(nn.Linear(hidden_dim, 1))
+        self.wavefront = nn.Sequential(*layers)
 
-    def _R_nm(self, n: int, m: int, rho: torch.Tensor) -> torch.Tensor:
-        radial_contribution = torch.zeros_like(rho, dtype=torch.float64)
-        radial_contribution += self._summation(n, m, rho)
-        return radial_contribution
 
-    def sum_basis_funcs(self):
-        device = self.center_x.device
-        x = torch.linspace(0, self.npixels - 1, self.npixels, dtype=torch.float64, device=device)
-        y = torch.linspace(0, self.npixels - 1, self.npixels, dtype=torch.float64, device=device)
-        x, y = torch.meshgrid(x, y, indexing="xy")
-        x = x - self.center_x
-        y = y - self.center_y
-        rho = torch.sqrt(x ** 2 + y ** 2)
-        theta = torch.atan2(y, x)
+    def forward(self, x, y):
+        x = x.long()
+        y = y.long()
+        basis = self.basis
+        batch_size = x.shape[0]
+        basis_at_coordinate = self.basis[torch.arange(batch_size), y, x]
+        basis_at_coordinate = basis[y, x]
 
-        idx = 0
-        output = torch.zeros((self.npixels, self.npixels), dtype=torch.float64,device=device)
-        ones = torch.ones((self.npixels, self.npixels), dtype=torch.float64, device=device)
+        return self.wavefront(basis_at_coordinate)
 
-        for n in range(self.n_max + 1):
-            for m in range(n + 1):
-                if (n - m) % 2 == 0:
-                    if m == 0:
-                        output += (
-                            self.basis_function_weights[idx]
-                            * self._R_nm(n, m, rho)
-                            * torch.sqrt(torch.tensor(n + 1, dtype=torch.float32, device=output.device))
-                        )
-                        idx += 1
-                    elif m % 2 == 0:
-                        output += (
-                            self.basis_function_weights[idx]
-                            * self._R_nm(n, m, rho)
-                            * torch.cos(m * theta)
-                            * torch.sqrt(torch.tensor(2*(n + 1), dtype=torch.float32, device=output.device))
-                        )
-                        idx += 1
-                    else:
-                        output += (
-                            self.basis_function_weights[idx]
-                            * self._R_nm(n, m, rho)
-                            * torch.sin(m * theta)
-                            * torch.sqrt(torch.tensor(2*(n + 1), dtype=torch.float32, device=output.device))
-                        )
-                        idx += 1
-        
-        rescaled = output + ones
-        normalization_constant = torch.max(rescaled)
-        return rescaled / normalization_constant
 
 class Wavefront(nn.Module):
     def __init__(self, npixels: int, diameter: float, wavelength: float, peak_flux: float, angles = None, basis=None):
@@ -272,7 +221,12 @@ class Wavefront(nn.Module):
             self.phase.data = torch.zeros_like(self.phase.data)
         else:
             if self.basis is not None:
-                self.amplitude = self.basis.sum_basis_funcs()
+                self.amplitude = torch.zeros(self.npixels, self.npixels, device=self.coordinates.device)
+                input_coordinates_x = self.coordinates[:, 0]
+                input_coordinates_y = self.coordinates[:, 1]
+                for i in range(self.npixels):
+                    for j in range(self.npixels):
+                        self.amplitude[i, j] = self.basis(self.coordinates[i, j, 0].unsqueeze(0), self.coordinates[i, j, 1].unsqueeze(0))
             else:
                 self.amplitude = nn.Parameter(torch.ones((1, self.npixels, self.npixels), dtype=torch.float64) / self.npixels**1)
             self.phase = nn.Parameter(torch.zeros((1, self.npixels, self.npixels), dtype=torch.float64))
@@ -280,7 +234,11 @@ class Wavefront(nn.Module):
     def get_phasor(self, angles_offset=None):
         opd = self.get_tilt_opd(angles_offset)
         if self.basis is not None:
-            self.amplitude = self.basis.sum_basis_funcs()
+            input_coordinates_x = self.coordinates[:, 0]
+            input_coordinates_y = self.coordinates[:, 1]
+            for i in range(self.npixels):
+                for j in range(self.npixels):
+                    self.amplitude[i, j] = self.basis(self.coordinates[i, j, 0].unsqueeze(0), self.coordinates[i, j, 1].unsqueeze(0))
         return self.amplitude * torch.exp(1j * (self.phase + opd))
 
     def get_tilt_opd(self, angles_offset=None):
@@ -464,7 +422,7 @@ if __name__ == "__main__":
     offset_STAR = nn.Parameter(torch.FloatTensor([args.star_offset_x * arcsec2rad(1 / (psf_pixel_scale * 1000)), args.star_offset_y * arcsec2rad(1 / (psf_pixel_scale * 1000))]))
     
     # Set up the wavefront objects
-    wavefronts_list1 = [Wavefront(wf_npix, diameter, wl, peak_flux_star, offset_STAR).to(DEVICE) for wl in wlen_weights[0]]
+    wavefronts_list1 = [Wavefront(wf_npix, diameter, wl, peak_flux_star, offset_STAR, basis=ZernikeNet(psf_npix)) for wl in wlen_weights[0]]).to(DEVICE)
 
     # Set up the propagation model parameters
     shift = [0.0, 0.0]
