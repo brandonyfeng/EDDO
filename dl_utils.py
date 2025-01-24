@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+from aotools.functions import zernikeArray
 
 def calc_nfringes(
     wavelength: float,
@@ -306,3 +307,38 @@ def rad2arcsec(values):
         The input values converted into arcseconds.
     """
     return values * (3600 * 180) / np.pi
+
+def crop_image(field, target_shape, pytorch=True, stacked_complex=True):
+    if target_shape is None:
+        return field
+    if pytorch:
+        if stacked_complex:
+            size_diff = np.array(field.shape[-3:-1]) - np.array(target_shape)
+            odd_dim = np.array(field.shape[-3:-1]) % 2
+        else:
+            size_diff = np.array(field.shape[-2:]) - np.array(target_shape)
+            odd_dim = np.array(field.shape[-2:]) % 2
+    else:
+        size_diff = np.array(field.shape[-2:]) - np.array(target_shape)
+        odd_dim = np.array(field.shape[-2:]) % 2
+    # crop dimensions that need to decrease in size
+    if (size_diff > 0).any():
+        crop_total = np.maximum(size_diff, 0)
+        crop_front = (crop_total + 1 - odd_dim) // 2
+        crop_end = (crop_total + odd_dim) // 2
+
+        crop_slices = [slice(int(f), int(-e) if e else None)
+                       for f, e in zip(crop_front, crop_end)]
+        if pytorch and stacked_complex:
+            return field[(..., *crop_slices, slice(None))]
+        else:
+            return field[(..., *crop_slices)]
+    else:
+        return field
+
+def compute_zernike_basis(num_polynomials, field_res):
+    zernike_diam = int(np.ceil(np.sqrt(field_res[0]**2 + field_res[1]**2)))
+    zernike = zernikeArray(num_polynomials, zernike_diam)
+    zernike = crop_image(zernike, field_res, pytorch=False)
+    zernike = torch.FloatTensor(zernike)
+    return zernike
