@@ -216,11 +216,13 @@ class Wavefront(nn.Module):
         else:
             if self.basis is not None:
                 self.amplitude = torch.zeros(self.npixels, self.npixels, device=self.coordinates.device)
-                amplitudes = []
-                for i in range(self.npixels):
-                    for j in range(self.npixels):
-                        amplitudes.append(self.basis(j, i))
-                self.amplitude = torch.stack(amplitudes).view(self.npixels, self.npixels).unsqueeze(0)
+                #amplitudes = []
+                i_indices, j_indices = torch.meshgrid(torch.arange(self.npixels), torch.arange(self.npixels), indexing='ij')
+                amplitudes = self.basis(j_indices, i_indices)
+                #for i in range(self.npixels):
+                 #   for j in range(self.npixels):
+                  #      amplitudes.append(self.basis(j, i))
+                self.amplitude = amplitudes.unsqueeze(0)
                 #self.amplitude = self.basis(coords_x, coords_y)
                 #self.amplitude = self.amplitude.unsqueeze(0)
             else:
@@ -230,11 +232,14 @@ class Wavefront(nn.Module):
     def get_phasor(self, angles_offset=None):
         opd = self.get_tilt_opd(angles_offset)
         if self.basis is not None:
-            amplitudes = []
-            for i in range(self.npixels):
-                for j in range(self.npixels):
-                    amplitudes.append(self.basis(j, i))
-            self.amplitude = torch.stack(amplitudes).view(self.npixels, self.npixels).unsqueeze(0)
+            #amplitudes = []
+            i_indices, j_indices = torch.meshgrid(torch.arange(self.npixels), torch.arange(self.npixels), indexing='ij')
+            amplitudes = self.basis(j_indices, i_indices)
+            self.amplitude = amplitudes.unsqueeze(0)
+            #for i in range(self.npixels):
+                #for j in range(self.npixels):
+                    #amplitudes.append(self.basis(j, i))
+            #self.amplitude = torch.stack(amplitudes).view(self.npixels, self.npixels).unsqueeze(0)
 
             #self.amplitude = self.basis(input_coordinates_x, input_coordinates_y)
             #self.amplitude = self.amplitude.unsqueeze(0)
