@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+from pyklip.klip import nan_gaussian_filter
 
 def calc_nfringes(
     wavelength: float,
@@ -306,3 +307,42 @@ def rad2arcsec(values):
         The input values converted into arcseconds.
     """
     return values * (3600 * 180) / np.pi
+
+
+def mask_annulus(im, radius,width=0.3):
+    x = np.linspace(-40 * 0.062424185, 40 * 0.062424185, 80)
+    y = np.linspace(-40 * 0.062424185, 40 * 0.062424185, 80)
+    mesh = np.meshgrid(x,y)
+    annulus = np.where((mesh[0]**2 + mesh[1]**2 > (radius-width)**2)&(mesh[0]**2 + mesh[1]**2 < (radius+width)**2), im, np.nan)
+    return annulus
+
+def circular_mask(im, peak_x,peak_y, rad_to_mask, value_to_mask, mask_inside=True):
+    x = np.linspace(-40 * 0.062424185, 40 * 0.062424185, 80)
+    y = np.linspace(-40 * 0.062424185, 40 * 0.062424185, 80)
+    mesh = np.meshgrid(x,y)
+    if mask_inside:
+        circlito = np.where(((mesh[0] - peak_x)**2 + (mesh[1]-peak_y)**2 < rad_to_mask**2), value_to_mask, im)
+    else:
+        circlito = np.where(((mesh[0] - peak_x)**2 + (mesh[1]-peak_y)**2 > rad_to_mask**2), value_to_mask, im)
+    return circlito
+
+# def get_peak_in_circle(im, offset_x,offset_y, rad):
+#     origin_x, origin_y = im.shape[0]/2, im.shape[1]/2
+#     offset_x_pix, offset_y_pix = offset_x/0.063, offset_y/0.063
+#     peakpix_x, peakpix_y = origin_x + offset_x_pix, origin_y+offset_y_pix
+#     xcoords = np.arange(im.shape[-1])
+#     mesh = np.meshgrid(xcoords,xcoords)
+#     circlito = np.where(((mesh[0] - peakpix_x)**2 + (mesh[1]-peakpix_y)**2 < rad**2), im, np.nan)
+#     return circlito
+
+def calc_snr(im, offset_x,offset_y, rad_blob, rad_ann, width=0.3):
+    im = nan_gaussian_filter(im, 3./2.335)
+    positive_blob = circular_mask(im, offset_x,offset_y, rad_blob, np.nan, mask_inside=False)
+    # positive_blob = nan_gaussian_filter(positive_blob, 3)
+    signal = np.nanmax(positive_blob)
+    positive_annulus = mask_annulus(im, rad_ann, width)
+    valid_annulus = np.where((~np.isnan(positive_annulus)&(np.isnan(positive_blob))), positive_annulus, np.nan)
+    # valid_annulus = nan_gaussian_filter(valid_annulus, 3./2.335)
+    # valid_annulus = nan_gaussian_filter(valid_annulus, 3)
+    noise = np.nanstd(valid_annulus)
+    return signal/noise, valid_annulus, positive_blob
