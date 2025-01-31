@@ -372,6 +372,7 @@ if __name__ == "__main__":
     parser.add_argument('--lr', default=1e-8, type=float)
     parser.add_argument('--star_offset_x', default=0, help='Initial star offset (in pixel)', type=float)
     parser.add_argument('--star_offset_y', default=0, help='Initial star offset (in pixel)', type=float)
+    parser.add_argument('--basis', default='zernike', help='Basis for the wavefront', type=str)
     args = parser.parse_args()
 
     DEVICE = 'cuda'
@@ -413,8 +414,10 @@ if __name__ == "__main__":
     offset_STAR = nn.Parameter(torch.FloatTensor([args.star_offset_x * arcsec2rad(1 / (psf_pixel_scale * 1000)), args.star_offset_y * arcsec2rad(1 / (psf_pixel_scale * 1000))]))
     
     # Set up the wavefront objects
-    wavefronts_list1 = [Wavefront(wf_npix, diameter, wl, peak_flux_star, offset_STAR, basis=ZernikeNet(wf_npix)).to(DEVICE) for wl in wlen_weights[0]]
-    #wavefronts_list1 = [Wavefront(wf_npix, diameter, wl, peak_flux_star, offset_STAR).to(DEVICE) for wl in wlen_weights[0]]
+    if args.basis == 'zernike':
+        wavefronts_list1 = [Wavefront(wf_npix, diameter, wl, peak_flux_star, offset_STAR, basis=ZernikeNet(wf_npix)).to(DEVICE) for wl in wlen_weights[0]]
+    else:
+        wavefronts_list1 = [Wavefront(wf_npix, diameter, wl, peak_flux_star, offset_STAR).to(DEVICE) for wl in wlen_weights[0]]
 
     # Set up the propagation model parameters
     shift = [0.0, 0.0]
@@ -511,48 +514,49 @@ if __name__ == "__main__":
         tbar_out = {'loss': global_l1_loss.item()}
         tbar.set_postfix(tbar_out)
 
-    final_wavefront_parameters = [parameters_to_vector(wavefront.parameters()) for wavefront in wavefronts_list1]
-    final_params_size = final_wavefront_parameters[0].shape[0]
-    print(f'Variance Final Parameters: {torch.var(final_wavefront_parameters[0])}')
-    variance_final_params = torch.var(final_wavefront_parameters[0])
+    if args.basis == 'zernike':
+        final_wavefront_parameters = [parameters_to_vector(wavefront.parameters()) for wavefront in wavefronts_list1]
+        final_params_size = final_wavefront_parameters[0].shape[0]
+        print(f'Variance Final Parameters: {torch.var(final_wavefront_parameters[0])}')
+        variance_final_params = torch.var(final_wavefront_parameters[0])
 
-    random_params_matrix = torch.zeros(final_params_size, len(final_wavefront_parameters)).to(DEVICE)
-    random_two_params_matrix = torch.zeros(final_params_size, len(final_wavefront_parameters)).to(DEVICE)
-    for i in range(len(final_wavefront_parameters)):
-        random_params = torch.randn(final_params_size).to(DEVICE)
-        random_two_params = torch.randn(final_params_size).to(DEVICE)
-        orthogonal_projection = torch.dot(random_two_params, random_params) / torch.dot(random_params, random_params)
-        random_two_params = random_two_params - orthogonal_projection * random_params
-        random_params_matrix[:, i] = random_params
-        random_two_params_matrix[:, i] = random_two_params
-
-
-    bound = torch.max(torch.stack([torch.mean(final_wavefront_parameters[i]) + 2 * torch.std(final_wavefront_parameters[i]) for i in range(len(final_wavefront_parameters))])
-)
+        random_params_matrix = torch.zeros(final_params_size, len(final_wavefront_parameters)).to(DEVICE)
+        random_two_params_matrix = torch.zeros(final_params_size, len(final_wavefront_parameters)).to(DEVICE)
+        for i in range(len(final_wavefront_parameters)):
+            random_params = torch.randn(final_params_size).to(DEVICE)
+            random_two_params = torch.randn(final_params_size).to(DEVICE)
+            orthogonal_projection = torch.dot(random_two_params, random_params) / torch.dot(random_params, random_params)
+            random_two_params = random_two_params - orthogonal_projection * random_params
+            random_params_matrix[:, i] = random_params
+            random_two_params_matrix[:, i] = random_two_params
 
 
-    loss_landscape = torch.zeros(100, 100)
-    loss_landscape_x = torch.linspace(-bound, bound, 100)
-    loss_landscape_y = torch.linspace(-bound, bound, 100)
+        bound = torch.max(torch.stack([torch.mean(final_wavefront_parameters[i]) + 2 * torch.std(final_wavefront_parameters[i]) for i in range(len(final_wavefront_parameters))])
+    )
 
-    
-    for i in tqdm.tqdm(range(len(loss_landscape_x)), desc="Outer Loop"):
-        for j in range(len(loss_landscape_y)):
-            for k in range(len(final_wavefront_parameters)):
-                random_params = random_params_matrix[:, k]
-                random_two_params = random_two_params_matrix[:, k]
-                vector_to_parameters(final_wavefront_parameters[k] + loss_landscape_x[i] * random_params + loss_landscape_y[j] * random_two_params, wavefronts_list1[k].parameters())
 
-            pred_1 = [p_model(wavefronts_list1, wfe_batch, wlen_weights[1], wlen_weights[0]) for p_model in prop_models]
-            pred_1 = torch.mean(torch.cat(pred_1, 0), 0)[None]
-            pred_scaled = pred_1 / pred_1.detach().median()
-            center_loss = F.smooth_l1_loss(pred_scaled[center_mask], obs_scaled[center_mask])
-            global_l1_loss = F.smooth_l1_loss(pred_scaled, obs_scaled)
-            loss = global_l1_loss + center_loss
-            loss_landscape[i, j] = loss.item()
-    
-    loss_landscape = loss_landscape.cpu().numpy()
-    np.save(f'{vis_dir}/loss_landscape_100.npy', loss_landscape)
+        loss_landscape = torch.zeros(100, 100)
+        loss_landscape_x = torch.linspace(-bound, bound, 100)
+        loss_landscape_y = torch.linspace(-bound, bound, 100)
+
+        
+        for i in tqdm.tqdm(range(len(loss_landscape_x)), desc="Outer Loop"):
+            for j in range(len(loss_landscape_y)):
+                for k in range(len(final_wavefront_parameters)):
+                    random_params = random_params_matrix[:, k]
+                    random_two_params = random_two_params_matrix[:, k]
+                    vector_to_parameters(final_wavefront_parameters[k] + loss_landscape_x[i] * random_params + loss_landscape_y[j] * random_two_params, wavefronts_list1[k].parameters())
+
+                pred_1 = [p_model(wavefronts_list1, wfe_batch, wlen_weights[1], wlen_weights[0]) for p_model in prop_models]
+                pred_1 = torch.mean(torch.cat(pred_1, 0), 0)[None]
+                pred_scaled = pred_1 / pred_1.detach().median()
+                center_loss = F.smooth_l1_loss(pred_scaled[center_mask], obs_scaled[center_mask])
+                global_l1_loss = F.smooth_l1_loss(pred_scaled, obs_scaled)
+                loss = global_l1_loss + center_loss
+                loss_landscape[i, j] = loss.item()
+        
+        loss_landscape = loss_landscape.cpu().numpy()
+        np.save(f'{vis_dir}/loss_landscape_100.npy', loss_landscape)
 
     progress_arr = torch.stack(progress_arr).cpu().numpy()[::5]
     progress_arr = np.array([(im - im.min()) / (im.max() - im.min()) for im in progress_arr])
