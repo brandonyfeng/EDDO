@@ -191,7 +191,7 @@ class ZernikeNet(nn.Module):
 
         def forward(self, x, y):
             basis_at_coordinate = self.basis[y, x, :]
-            return self.wavefront(basis_at_coordinate)
+            return self.wavefront(basis_at_coordinate).squeeze(-1)
 
 
 class Wavefront(nn.Module):
@@ -218,18 +218,17 @@ class Wavefront(nn.Module):
             if self.basis is not None:
                 self.amplitude = torch.zeros(self.npixels, self.npixels, device=self.coordinates.device)
                 i_indices, j_indices = torch.meshgrid(torch.arange(self.npixels), torch.arange(self.npixels), indexing='ij')
+                i_indices = i_indices.flatten()
+                j_indices = j_indices.flatten()
                 amplitudes = self.basis(j_indices, i_indices)
-                self.amplitude = amplitudes.unsqueeze(0)
+                amplitudes = amplitudes.view(1, self.npixels, self.npixels)
+                self.amplitude = nn.Parameter(self.amplitude.to(DEVICE), requires_grad=True)
             else:
                 self.amplitude = nn.Parameter(torch.ones((1, self.npixels, self.npixels), dtype=torch.float64) / self.npixels**1)
             self.phase = nn.Parameter(torch.zeros((1, self.npixels, self.npixels), dtype=torch.float64))
 
     def get_phasor(self, angles_offset=None):
         opd = self.get_tilt_opd(angles_offset)
-        #if self.basis is not None:
-            #i_indices, j_indices = torch.meshgrid(torch.arange(self.npixels), torch.arange(self.npixels), indexing='ij')
-            #amplitudes = self.basis(j_indices, i_indices)
-            #self.amplitude = amplitudes.unsqueeze(0)
         return self.amplitude * torch.exp(1j * (self.phase + opd))
 
     def get_tilt_opd(self, angles_offset=None):
@@ -270,6 +269,7 @@ class Wavefront(nn.Module):
             _npixels = (npixels * (pad - 1)) // 2
             phasor = torch.nn.functional.pad(phasor, (_npixels, ) * 4)
 
+        #print(phasor.shape)
         phasor = torch.fft.fftshift(torch.fft.ifft2(phasor), dim=[-2, -1])
 
         return phasor
@@ -438,6 +438,7 @@ if __name__ == "__main__":
         pred = [p_model(wavefronts_list1, wfe_batch, wlen_weights[1], wlen_weights[0]) for p_model in prop_models]
         pred = torch.mean(torch.cat(pred, 0), 0)
     pred_np = pred.cpu().numpy()
+    #print(pred_np.shape)
     plt.imsave(f'{vis_dir}/vis_PSF_render_init.png', pred_np, cmap='viridis', origin='lower')
 
     z_score_measurement = (real_im[0] - real_im[0].mean()) / real_im[0].std()
