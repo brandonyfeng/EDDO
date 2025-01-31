@@ -9,6 +9,7 @@ from poppy.zernike import zernike_basis
 from matplotlib import rcParams, rc
 from matplotlib.gridspec import GridSpec
 from mpl_toolkits.axes_grid1 import make_axes_locatable
+from torch.nn.utils import parameters_to_vector, vector_to_parameters
 
 def set_rc_params(fontsize=None):
     '''
@@ -166,7 +167,7 @@ class AngleOffsetModule(nn.Module):
         return self.data
 
 class ZernikeNet(nn.Module):
-        def __init__(self, PSF_size, hidden_dim=128, phs_layers=2):
+        def __init__(self, PSF_size, hidden_dim=32, phs_layers=2):
             super(ZernikeNet, self).__init__()
             self.PSF_size = PSF_size
             self.basis = nn.Parameter(compute_zernike_basis(
@@ -216,33 +217,19 @@ class Wavefront(nn.Module):
         else:
             if self.basis is not None:
                 self.amplitude = torch.zeros(self.npixels, self.npixels, device=self.coordinates.device)
-                #amplitudes = []
                 i_indices, j_indices = torch.meshgrid(torch.arange(self.npixels), torch.arange(self.npixels), indexing='ij')
                 amplitudes = self.basis(j_indices, i_indices)
-                #for i in range(self.npixels):
-                 #   for j in range(self.npixels):
-                  #      amplitudes.append(self.basis(j, i))
                 self.amplitude = amplitudes.unsqueeze(0)
-                #self.amplitude = self.basis(coords_x, coords_y)
-                #self.amplitude = self.amplitude.unsqueeze(0)
             else:
                 self.amplitude = nn.Parameter(torch.ones((1, self.npixels, self.npixels), dtype=torch.float64) / self.npixels**1)
             self.phase = nn.Parameter(torch.zeros((1, self.npixels, self.npixels), dtype=torch.float64))
 
     def get_phasor(self, angles_offset=None):
         opd = self.get_tilt_opd(angles_offset)
-        if self.basis is not None:
-            #amplitudes = []
-            i_indices, j_indices = torch.meshgrid(torch.arange(self.npixels), torch.arange(self.npixels), indexing='ij')
-            amplitudes = self.basis(j_indices, i_indices)
-            self.amplitude = amplitudes.unsqueeze(0)
-            #for i in range(self.npixels):
-                #for j in range(self.npixels):
-                    #amplitudes.append(self.basis(j, i))
-            #self.amplitude = torch.stack(amplitudes).view(self.npixels, self.npixels).unsqueeze(0)
-
-            #self.amplitude = self.basis(input_coordinates_x, input_coordinates_y)
-            #self.amplitude = self.amplitude.unsqueeze(0)
+        #if self.basis is not None:
+            #i_indices, j_indices = torch.meshgrid(torch.arange(self.npixels), torch.arange(self.npixels), indexing='ij')
+            #amplitudes = self.basis(j_indices, i_indices)
+            #self.amplitude = amplitudes.unsqueeze(0)
         return self.amplitude * torch.exp(1j * (self.phase + opd))
 
     def get_tilt_opd(self, angles_offset=None):
@@ -427,6 +414,7 @@ if __name__ == "__main__":
     
     # Set up the wavefront objects
     wavefronts_list1 = [Wavefront(wf_npix, diameter, wl, peak_flux_star, offset_STAR, basis=ZernikeNet(wf_npix)).to(DEVICE) for wl in wlen_weights[0]]
+    #wavefronts_list1 = [Wavefront(wf_npix, diameter, wl, peak_flux_star, offset_STAR).to(DEVICE) for wl in wlen_weights[0]]
 
     # Set up the propagation model parameters
     shift = [0.0, 0.0]
@@ -521,6 +509,49 @@ if __name__ == "__main__":
 
         tbar_out = {'loss': global_l1_loss.item()}
         tbar.set_postfix(tbar_out)
+
+    final_wavefront_parameters = [parameters_to_vector(wavefront.parameters()) for wavefront in wavefronts_list1]
+    final_params_size = final_wavefront_parameters[0].shape[0]
+    print(f'Variance Final Parameters: {torch.var(final_wavefront_parameters[0])}')
+    variance_final_params = torch.var(final_wavefront_parameters[0])
+
+    random_params_matrix = torch.zeros(final_params_size, len(final_wavefront_parameters)).to(DEVICE)
+    random_two_params_matrix = torch.zeros(final_params_size, len(final_wavefront_parameters)).to(DEVICE)
+    for i in range(len(final_wavefront_parameters)):
+        random_params = torch.randn(final_params_size).to(DEVICE)
+        random_two_params = torch.randn(final_params_size).to(DEVICE)
+        orthogonal_projection = torch.dot(random_two_params, random_params) / torch.dot(random_params, random_params)
+        random_two_params = random_two_params - orthogonal_projection * random_params
+        random_params_matrix[:, i] = random_params
+        random_two_params_matrix[:, i] = random_two_params
+
+
+    bound = torch.max(torch.stack([torch.mean(final_wavefront_parameters[i]) + 2 * torch.std(final_wavefront_parameters[i]) for i in range(len(final_wavefront_parameters))])
+)
+
+
+    loss_landscape = torch.zeros(100, 100)
+    loss_landscape_x = torch.linspace(-bound, bound, 100)
+    loss_landscape_y = torch.linspace(-bound, bound, 100)
+
+    
+    for i in tqdm.tqdm(range(len(loss_landscape_x)), desc="Outer Loop"):
+        for j in range(len(loss_landscape_y)):
+            for k in range(len(final_wavefront_parameters)):
+                random_params = random_params_matrix[:, k]
+                random_two_params = random_two_params_matrix[:, k]
+                vector_to_parameters(final_wavefront_parameters[k] + loss_landscape_x[i] * random_params + loss_landscape_y[j] * random_two_params, wavefronts_list1[k].parameters())
+
+            pred_1 = [p_model(wavefronts_list1, wfe_batch, wlen_weights[1], wlen_weights[0]) for p_model in prop_models]
+            pred_1 = torch.mean(torch.cat(pred_1, 0), 0)[None]
+            pred_scaled = pred_1 / pred_1.detach().median()
+            center_loss = F.smooth_l1_loss(pred_scaled[center_mask], obs_scaled[center_mask])
+            global_l1_loss = F.smooth_l1_loss(pred_scaled, obs_scaled)
+            loss = global_l1_loss + center_loss
+            loss_landscape[i, j] = loss.item()
+    
+    loss_landscape = loss_landscape.cpu().numpy()
+    np.save(f'{vis_dir}/loss_landscape_100.npy', loss_landscape)
 
     progress_arr = torch.stack(progress_arr).cpu().numpy()[::5]
     progress_arr = np.array([(im - im.min()) / (im.max() - im.min()) for im in progress_arr])
