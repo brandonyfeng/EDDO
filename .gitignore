@@ -1,3 +1,5 @@
 no_wfe_3K_iters/
 wl_dependance.py
 data/noisemaps_ref_targ/
+*npy
+*png
