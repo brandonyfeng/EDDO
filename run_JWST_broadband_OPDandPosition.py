@@ -514,7 +514,7 @@ if __name__ == "__main__":
         tbar_out = {'loss': global_l1_loss.item()}
         tbar.set_postfix(tbar_out)
 
-    if args.basis == 'zernike':
+    if args.basis != 'zernike':
         final_wavefront_parameters = [parameters_to_vector(wavefront.parameters()) for wavefront in wavefronts_list1]
         final_params_size = final_wavefront_parameters[0].shape[0]
         print(f'Variance Final Parameters: {torch.var(final_wavefront_parameters[0])}')
