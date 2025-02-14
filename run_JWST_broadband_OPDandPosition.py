@@ -175,7 +175,7 @@ class SinusoidalActivation(nn.Module):
         return torch.sin(self.omega * x)
 
 class ZernikeNet(nn.Module):
-        def __init__(self, PSF_size, hidden_dim=32, phs_layers=2, init='xavier'):
+        def __init__(self, PSF_size, hidden_dim=32, phs_layers=2, init='xavier', activation='sinusoidal'):
             super(ZernikeNet, self).__init__()
             self.PSF_size = PSF_size
             self.basis = ZernikeNet.safe_nan_to_num(
@@ -187,8 +187,11 @@ class ZernikeNet(nn.Module):
             hidden_dim = hidden_dim
             in_dim = self.basis.shape[-1]
 
-            #act_fn = nn.LeakyReLU(inplace=True)
-            act_fn = SinusoidalActivation()
+            if activation == 'sinusoidal':
+                act_fn = SinusoidalActivation()
+            else:
+                act_fn = nn.LeakyReLU(inplace=True)
+
             layers = []
             layers.append(nn.Linear(in_dim, hidden_dim))
             for _ in range(phs_layers):
@@ -205,7 +208,11 @@ class ZernikeNet(nn.Module):
             else:
                 raise ValueError(f'Invalid init method {init}')
 
-        def forward(self, x, y):
+        def forward(self, x=None, y=None, batch_size=8):
+            device = self.basis.device
+            if x is None or y is None:
+                x = torch.randint(0, self.PSF_size, (batch_size,), device=device)
+                y = torch.randint(0, self.PSF_size, (batch_size,), device=device)
             basis_at_coordinate = self.basis[y, x, :]
             return self.wavefront(basis_at_coordinate).squeeze(-1)
 
