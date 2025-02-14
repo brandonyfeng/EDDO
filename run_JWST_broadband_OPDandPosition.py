@@ -166,19 +166,29 @@ class AngleOffsetModule(nn.Module):
 
         return self.data
 
+class SinusoidalActivation(nn.Module):
+    def __init__(self, omega=3.0):
+        super(SinusoidalActivation, self).__init__()
+        self.omega = omega
+
+    def forward(self, x):
+        return torch.sin(self.omega * x)
+
 class ZernikeNet(nn.Module):
-        def __init__(self, PSF_size, hidden_dim=32, phs_layers=2):
+        def __init__(self, PSF_size, hidden_dim=32, phs_layers=2, init='xavier'):
             super(ZernikeNet, self).__init__()
             self.PSF_size = PSF_size
-            self.basis = nn.Parameter(compute_zernike_basis(
-                num_polynomials=28,
-                field_res=(PSF_size, PSF_size)).permute(1, 2, 0),
-                requires_grad=False)
+            self.basis = ZernikeNet.safe_nan_to_num(
+                    compute_zernike_basis(num_polynomials=28, 
+                                          field_res=(PSF_size, PSF_size)).permute(1, 2, 0))
+
+            self.basis = nn.Parameter(self.basis, requires_grad=False)
 
             hidden_dim = hidden_dim
             in_dim = self.basis.shape[-1]
 
-            act_fn = nn.LeakyReLU(inplace=True)
+            #act_fn = nn.LeakyReLU(inplace=True)
+            act_fn = SinusoidalActivation()
             layers = []
             layers.append(nn.Linear(in_dim, hidden_dim))
             for _ in range(phs_layers):
@@ -188,10 +198,32 @@ class ZernikeNet(nn.Module):
 
             layers.append(nn.Linear(hidden_dim, 1))
             self.wavefront = nn.Sequential(*layers)
+            if init == 'xavier':
+                self.xavier_init()
+            elif init == 'kaiming':
+                self.kaming_init()
+            else:
+                raise ValueError(f'Invalid init method {init}')
 
         def forward(self, x, y):
             basis_at_coordinate = self.basis[y, x, :]
             return self.wavefront(basis_at_coordinate).squeeze(-1)
+
+        @staticmethod
+        def safe_nan_to_num(x):
+            return torch.where(torch.isnan(x), torch.zeros_like(x), x)
+
+        def kaming_init(self):
+            for layer in self.wavefront:
+                if isinstance(layer, nn.Linear):
+                    nn.init.kaiming_normal_(layer.weight)
+                    nn.init.zeros_(layer.bias)
+
+        def xavier_init(self):
+            for layer in self.wavefront:
+                if isinstance(layer, nn.Linear):
+                    nn.init.xavier_normal_(layer.weight)
+                    nn.init.zeros_(layer.bias)
 
 
 class Wavefront(nn.Module):
@@ -208,6 +240,10 @@ class Wavefront(nn.Module):
             angles = torch.zeros(2)
         self.angles = nn.Parameter(angles, requires_grad=True)
         self.basis = basis
+        self.amplitude_basis_real = basis
+        self.amplitude_basis_complex = basis
+        self.phase_basis_real = basis
+        self.phase_basis_complex = basis
         self.reset()
     
     def reset(self):
@@ -220,16 +256,53 @@ class Wavefront(nn.Module):
                 i_indices, j_indices = torch.meshgrid(torch.arange(self.npixels), torch.arange(self.npixels), indexing='ij')
                 i_indices = i_indices.flatten()
                 j_indices = j_indices.flatten()
-                amplitudes = self.basis(j_indices, i_indices)
-                amplitudes = amplitudes.view(1, self.npixels, self.npixels)
+
+                amplitudes_real = self.amplitude_basis_real(j_indices, i_indices)
+                amplitudes_real = amplitudes_real.view(1, self.npixels, self.npixels)
+
+                amplitudes_complex = self.amplitude_basis_complex(j_indices, i_indices)
+                amplitudes_complex = amplitudes_complex.view(1, self.npixels, self.npixels)
+
+                amplitudes = torch.complex(amplitudes_real, amplitudes_complex)
+
+                self.amplitude = amplitudes
                 self.amplitude = nn.Parameter(self.amplitude.to(DEVICE), requires_grad=True)
+
+                phases_real = self.phase_basis_real(j_indices, i_indices)
+                phases_real = phases_real.view(1, self.npixels, self.npixels)
+
+                phases_complex = self.phase_basis_complex(j_indices, i_indices)
+                phases_complex = phases_complex.view(1, self.npixels, self.npixels)
+
+                phases = torch.complex(phases_real, phases_complex)
+
+                self.phase = phases
+                self.phase = nn.Parameter(self.phase.to(DEVICE), requires_grad=True)
             else:
                 self.amplitude = nn.Parameter(torch.ones((1, self.npixels, self.npixels), dtype=torch.float64) / self.npixels**1)
-            self.phase = nn.Parameter(torch.zeros((1, self.npixels, self.npixels), dtype=torch.float64))
+                self.phase = nn.Parameter(torch.zeros((1, self.npixels, self.npixels), dtype=torch.float64))
 
     def get_phasor(self, angles_offset=None):
-        opd = self.get_tilt_opd(angles_offset)
-        return self.amplitude * torch.exp(1j * (self.phase + opd))
+        if self.basis is not None:
+            opd = self.get_tilt_opd(angles_offset)
+            i_indices, j_indices = torch.meshgrid(torch.arange(self.npixels), torch.arange(self.npixels), indexing='ij')
+            i_indices = i_indices.flatten()
+            j_indices = j_indices.flatten()
+            amplitudes_real = self.amplitude_basis_real(j_indices, i_indices)
+            amplitudes_real = amplitudes_real.view(1, self.npixels, self.npixels)
+            amplitudes_complex = self.amplitude_basis_complex(j_indices, i_indices)
+            amplitudes_complex = amplitudes_complex.view(1, self.npixels, self.npixels)
+            amplitudes = torch.complex(amplitudes_real, amplitudes_complex)
+            phases_real = self.phase_basis_real(j_indices, i_indices)
+            phases_real = phases_real.view(1, self.npixels, self.npixels)
+            phases_complex = self.phase_basis_complex(j_indices, i_indices)
+            phases_complex = phases_complex.view(1, self.npixels, self.npixels)
+            phases = torch.complex(phases_real, phases_complex)
+            out = amplitudes * torch.exp(1j * phases + opd)
+        else:
+            opd = self.get_tilt_opd(angles_offset)
+            out = self.amplitude * torch.exp(1j * (self.phase + opd))
+        return out
 
     def get_tilt_opd(self, angles_offset=None):
         if angles_offset is not None:
@@ -442,6 +515,7 @@ if __name__ == "__main__":
         pred = torch.mean(torch.cat(pred, 0), 0)
     pred_np = pred.cpu().numpy()
     #print(pred_np.shape)
+
     plt.imsave(f'{vis_dir}/vis_PSF_render_init.png', pred_np, cmap='viridis', origin='lower')
 
     z_score_measurement = (real_im[0] - real_im[0].mean()) / real_im[0].std()
@@ -483,6 +557,7 @@ if __name__ == "__main__":
     zscore_arr = []
 
     tbar = tqdm.tqdm(range(args.iters + 1))
+    losses = []
     for i in tbar:
         optimizer.zero_grad()
 
@@ -492,13 +567,14 @@ if __name__ == "__main__":
         zscore_arr.append(z_score_pred)
 
         # compute loss in median-scaled space
-        pred_scaled = pred_1 / pred_1.detach().median()
+        pred_scaled = pred_1 / (pred_1.detach().median() + 1e-8)
         
         center_loss = F.smooth_l1_loss(pred_scaled[center_mask], obs_scaled[center_mask])
         global_l1_loss = F.smooth_l1_loss(pred_scaled, obs_scaled)
         loss = global_l1_loss + center_loss
 
         loss.backward()
+        losses.append(loss.item())
         optimizer.step()
         scheduler.step()
 
@@ -618,6 +694,12 @@ if __name__ == "__main__":
     plt.legend()
     plt.savefig(f'{vis_dir}/zernike_weights.png')
     plt.close()
+
+    plt.figure(figsize=(18, 10))
+    plt.plot(losses)
+    plt.xlabel('Iteration')
+    plt.ylabel('Loss')
+    plt.savefig(f'{vis_dir}/loss_iteration.png')
 
     opd_vis_arr = torch.stack(opd_vis_arr)[::5]
     opd_vis_arr = (opd_vis_arr - opd_vis_arr[0:1]).abs().numpy()
