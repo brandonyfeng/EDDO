@@ -209,10 +209,6 @@ class ZernikeNet(nn.Module):
                 raise ValueError(f'Invalid init method {init}')
 
         def forward(self, x=None, y=None, batch_size=8):
-            device = self.basis.device
-            if x is None or y is None:
-                x = torch.randint(0, self.PSF_size, (batch_size,), device=device)
-                y = torch.randint(0, self.PSF_size, (batch_size,), device=device)
             basis_at_coordinate = self.basis[y, x, :]
             return self.wavefront(basis_at_coordinate).squeeze(-1)
 
@@ -247,8 +243,8 @@ class Wavefront(nn.Module):
             angles = torch.zeros(2)
         self.angles = nn.Parameter(angles, requires_grad=True)
         self.basis = basis
-        self.amplitude_basis_real = basis
-        self.amplitude_basis_complex = basis
+        #self.amplitude_basis_real = basis
+        #self.amplitude_basis_complex = basis
         self.phase_basis_real = basis
         self.phase_basis_complex = basis
         self.reset()
@@ -264,16 +260,16 @@ class Wavefront(nn.Module):
                 i_indices = i_indices.flatten()
                 j_indices = j_indices.flatten()
 
-                amplitudes_real = self.amplitude_basis_real(j_indices, i_indices)
-                amplitudes_real = amplitudes_real.view(1, self.npixels, self.npixels)
+                #amplitudes_real = self.amplitude_basis_real(j_indices, i_indices)
+                #amplitudes_real = amplitudes_real.view(1, self.npixels, self.npixels)
 
-                amplitudes_complex = self.amplitude_basis_complex(j_indices, i_indices)
-                amplitudes_complex = amplitudes_complex.view(1, self.npixels, self.npixels)
+                #amplitudes_complex = self.amplitude_basis_complex(j_indices, i_indices)
+                #amplitudes_complex = amplitudes_complex.view(1, self.npixels, self.npixels)
 
-                amplitudes = torch.complex(amplitudes_real, amplitudes_complex)
+                #amplitudes = torch.complex(amplitudes_real, amplitudes_complex)
 
-                self.amplitude = amplitudes
-                self.amplitude = nn.Parameter(self.amplitude.to(DEVICE), requires_grad=True)
+                #self.amplitude = amplitudes
+                #self.amplitude = nn.Parameter(self.amplitude.to(DEVICE), requires_grad=True)
 
                 phases_real = self.phase_basis_real(j_indices, i_indices)
                 phases_real = phases_real.view(1, self.npixels, self.npixels)
@@ -291,21 +287,23 @@ class Wavefront(nn.Module):
 
     def get_phasor(self, angles_offset=None):
         if self.basis is not None:
-            opd = self.get_tilt_opd(angles_offset)
+            #opd = self.get_tilt_opd(angles_offset)
             i_indices, j_indices = torch.meshgrid(torch.arange(self.npixels), torch.arange(self.npixels), indexing='ij')
             i_indices = i_indices.flatten()
             j_indices = j_indices.flatten()
-            amplitudes_real = self.amplitude_basis_real(j_indices, i_indices)
-            amplitudes_real = amplitudes_real.view(1, self.npixels, self.npixels)
-            amplitudes_complex = self.amplitude_basis_complex(j_indices, i_indices)
-            amplitudes_complex = amplitudes_complex.view(1, self.npixels, self.npixels)
-            amplitudes = torch.complex(amplitudes_real, amplitudes_complex)
+            #amplitudes_real = self.amplitude_basis_real(j_indices, i_indices)
+            #amplitudes_real = amplitudes_real.view(1, self.npixels, self.npixels)
+            #amplitudes_complex = self.amplitude_basis_complex(j_indices, i_indices)
+            #amplitudes_complex = amplitudes_complex.view(1, self.npixels, self.npixels)
+            #amplitudes = torch.complex(amplitudes_real, amplitudes_complex)
             phases_real = self.phase_basis_real(j_indices, i_indices)
             phases_real = phases_real.view(1, self.npixels, self.npixels)
             phases_complex = self.phase_basis_complex(j_indices, i_indices)
             phases_complex = phases_complex.view(1, self.npixels, self.npixels)
             phases = torch.complex(phases_real, phases_complex)
-            out = amplitudes * torch.exp(1j * phases + opd)
+            #out = amplitudes * torch.exp(1j * phases + opd)
+            #out = torch.exp(1j * phases + opd)
+            out = torch.exp(1j * phases)
         else:
             opd = self.get_tilt_opd(angles_offset)
             out = self.amplitude * torch.exp(1j * (self.phase + opd))
