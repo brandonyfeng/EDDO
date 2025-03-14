@@ -22,6 +22,23 @@ from dl_utils import pixel_coords, crop_to, circle, arcsec2rad, partial_MFT
 DEVICE = 'cuda'
 ffmpeg_kargs = {'macro_block_size': None, 'ffmpeg_params': ['-s','256x256', '-v', '0'], 'fps': 4, }
 
+def beta_nll_loss(mean, variance, target, beta=1.0):
+    """Compute beta-NLL loss
+
+    :param mean: Predicted mean of shape B x D
+    :param variance: Predicted variance of shape B x D
+    :param target: Target of shape B x D
+    :param beta: Parameter from range [0, 1] controlling relative
+        weighting between data points, where `0` corresponds to
+        high weight on low error points and `1` to an equal weighting.
+    :returns: Loss per batch element of shape B
+    """
+    loss = 0.5 * ((target - mean) ** 2 / variance + variance.log())
+
+    if beta > 0:
+        loss = loss * (variance.detach() ** beta)
+
+    return loss.sum(axis=-1)
 
 def load_data(N, data_dir, opd_data_dir, multi_snap):
     aperture = np.load(f'{data_dir}/primary_transmission_1024.npy')
@@ -52,89 +69,9 @@ def load_data(N, data_dir, opd_data_dir, multi_snap):
 
     return aperture, lyot, fpm, nircam_opd, sampledWFEs, sampledWFEs_2
 
-class Zernike(nn.Module):
-    def __init__(self, n_max: int, m_max: int, npixels: int):
-        super().__init__()
-        self.n_max = n_max
-        self.m_max = m_max
-        self.npixels = npixels
-        number_of_zernikes = (n_max + 1) * (n_max + 2) // 2
-        self.basis_function_weights = nn.Parameter(
-            torch.randn(number_of_zernikes, dtype=torch.float64), requires_grad=True
-        )
-        self.center_x = nn.Parameter(
-            torch.tensor(npixels / 2, dtype=torch.float64), requires_grad=False
-        )
-        self.center_y = nn.Parameter(
-            torch.tensor(npixels / 2, dtype=torch.float64), requires_grad=False
-        )
-
-    @staticmethod
-    def _factorial(x: torch.Tensor) -> torch.Tensor:
-        return torch.lgamma(x + 1).exp()
-
-    def _f_nms(self, n: int, m: int, s: torch.Tensor, rho: torch.Tensor) -> torch.Tensor:
-        s_3d = s.view(-1, 1, 1)
-        return (
-            (-1) ** s_3d
-            * self._factorial(n - s_3d)
-            * self._factorial((n - m) / 2 - s_3d)
-            * rho ** (n - 2 * s_3d)
-            / (self._factorial(s_3d) * self._factorial((n + m) / 2 - s_3d))
-        )
-
-    def _summation(self, n: int, m: int, rho: torch.Tensor) -> torch.Tensor:
-        indices_s = torch.arange(0, (n - m) / 2, dtype=torch.float64)
-        return self._f_nms(n, m, indices_s, rho).sum(dim=0)
-
-    def _R_nm(self, n: int, m: int, rho: torch.Tensor) -> torch.Tensor:
-        radial_contribution = torch.zeros_like(rho, dtype=torch.float64)
-        radial_contribution += self._summation(n, m, rho)
-        return radial_contribution
-
-    def sum_basis_funcs(self):
-        x = torch.linspace(0, self.npixels - 1, self.npixels, dtype=torch.float64)
-        y = torch.linspace(0, self.npixels - 1, self.npixels, dtype=torch.float64)
-        x, y = torch.meshgrid(x, y, indexing="xy")
-        x = x - self.center_x
-        y = y - self.center_y
-        rho = torch.sqrt(x ** 2 + y ** 2)
-        theta = torch.atan2(y, x)
-
-        idx = 0
-        output = torch.zeros((self.npixels, self.npixels), dtype=torch.float64)
-
-        for n in range(self.n_max + 1):
-            for m in range(n + 1)):
-                if (n - m) % 2 == 0:
-                    if m == 0:
-                        output += (
-                            self.basis_function_weights[idx]
-                            * self._R_nm(n, m, rho)
-                            * torch.sqrt(torch.tensor(n + 1, dtype=torch.float32))
-                        )
-                        idx += 1
-                    elif m % 2 == 0:
-                        output += (
-                            self.basis_function_weights[idx]
-                            * self._R_nm(n, m, rho)
-                            * torch.cos(m * theta)
-                            * torch.sqrt(torch.tensor(2*(n + 1), dtype=torch.float32))
-                        )
-                        idx += 1
-                    else:
-                        output += (
-                            self.basis_function_weights[idx]
-                            * self._R_nm(n, m, rho)
-                            * torch.sin(m * theta)
-                            * torch.sqrt(torch.tensor(2*(n + 1), dtype=torch.float32))
-                        )
-                        idx += 1
-
-        return output
 
 class Wavefront(nn.Module):
-    def __init__(self, npixels: int, diameter: float, wavelength: float, peak_flux: float, angles = None, basis=None):
+    def __init__(self, npixels: int, diameter: float, wavelength: float, peak_flux: float, angles = None):
         super().__init__()
         self.wavelength = nn.Parameter(torch.from_numpy(np.asarray(wavelength, float)), requires_grad=False)
         self.pixel_scale = nn.Parameter(torch.from_numpy(np.asarray(diameter / npixels, float)), requires_grad=False)
@@ -146,7 +83,6 @@ class Wavefront(nn.Module):
         if angles is None:
             angles = torch.zeros(2)
         self.angles = nn.Parameter(angles, requires_grad=True)
-        self.basis = basis
         self.reset()
 
     def reset(self):
@@ -154,16 +90,10 @@ class Wavefront(nn.Module):
             self.amplitude.data = torch.ones_like(self.amplitude.data) / self.npixels**1
             self.phase.data = torch.zeros_like(self.phase.data)
         else:
-            if self.basis is not None:
-                self.amplitude = self.basis.sum_basis_funcs()
-            else:
-                self.amplitude = nn.Parameter(torch.ones((1, self.npixels, self.npixels), dtype=torch.float64) / self.npixels**1)
+            self.amplitude = nn.Parameter(torch.ones((1, self.npixels, self.npixels), dtype=torch.float64) / self.npixels**1)
             self.phase = nn.Parameter(torch.zeros((1, self.npixels, self.npixels), dtype=torch.float64))
-                                
 
     def get_phasor(self):
-        if self.basis is not None:
-            self.amplitude = self.basis.sum_basis_funcs()
         opd = self.get_tilt_opd()
         return self.amplitude * torch.exp(1j * (self.phase + opd))
 
@@ -240,6 +170,8 @@ class PointPropagate(nn.Module):
         self.x_mat = nn.Parameter(x_mat, requires_grad=False)
         self.y_mat = nn.Parameter(y_mat, requires_grad=False)
         self.mult = nn.Parameter(torch.tensor(mult, dtype=torch.float64), requires_grad=False)
+        psf_size = args[3]
+        self.uncertainty_matrix = nn.Parameter(torch.ones((psf_size, psf_size), dtype=torch.float64), requires_grad=True)
 
     def forward(self, wavefront, wfe):
         phasor = wavefront.get_phasor()
@@ -254,7 +186,9 @@ class PointPropagate(nn.Module):
         w = wavefront.peak_flux ** 0.5
         out = (torch.abs(phasor) * w) ** 2
 
-        return out
+        uncertainty_matrix = F.softplus(self.uncertainty_matrix)
+
+        return out, self.uncertainty_matrix
 
     def forward_val(self, wavefront):
         phasor = wavefront.get_phasor()
@@ -416,9 +350,9 @@ if __name__ == "__main__":
     flux_1, flux_2 = peak_flux_star, peak_flux_planet
 
     # Set up the wavefront objects
-    plane_wave_1 = Wavefront(wf_npix, diameter, wavelen, flux_1, basis=Zernike(20, 10, wf_npix))
+    plane_wave_1 = Wavefront(wf_npix, diameter, wavelen, flux_1)
     plane_wave_1 = plane_wave_1.to(DEVICE)
-    plane_wave_2 = Wavefront(wf_npix, diameter, wavelen, flux_2, offset, basis=Zernike(20, 10, wf_npix))
+    plane_wave_2 = Wavefront(wf_npix, diameter, wavelen, flux_2, offset)
     plane_wave_2 = plane_wave_2.to(DEVICE)
 
     # Set up the propagation model parameters
@@ -439,8 +373,16 @@ if __name__ == "__main__":
 
     # Visualize the resulting PSF
     out_1, out_2 = [], []
-    out_1 = p1_model(plane_wave_1, sampledWFEs).detach().cpu()
-    out_2 = p2_model(plane_wave_2, sampledWFEs).detach().cpu()
+    if args.loss_fn == 'beta':
+        out_1, uq_1 = p1_model(plane_wave_1, sampledWFEs)
+        out_2, uq_2 = p2_model(plane_wave_2, sampledWFEs)
+        out_1 = out_1.detach().cpu()
+        out_2 = out_2.detach().cpu()
+        uq_1 = uq_1.detach().cpu()
+        uq_2 = uq_2.detach().cpu()
+    else:
+        out_1 = p1_model(plane_wave_1, sampledWFEs).detach().cpu()
+        out_2 = p2_model(plane_wave_2, sampledWFEs).detach().cpu()
     out = out_1 + out_2
 
     # Visualize subtracted PSF using the ground truth WFE
@@ -507,7 +449,10 @@ if __name__ == "__main__":
         e_pred = []
         for batch in range(0, N, 32):
             cur_wfe = wfe_batch[batch:batch + 32]
-            pred_1 = p1_model(plane_wave_1, cur_wfe)
+            if args.loss_fn == 'beta':
+                pred_1, _ = p1_model(plane_wave_1, cur_wfe)
+            else:
+                pred_1 = p1_model(plane_wave_1, cur_wfe)
             e_pred.append(pred_1.detach().cpu())
         e_pred = torch.cat(e_pred)
 
@@ -527,7 +472,12 @@ if __name__ == "__main__":
     wfe_err_arr.append(wfe_err.item())
 
     # Set up the optimizer and scheduler
-    optimizer = torch.optim.Adam([wfe_batch], lr=lr)
+    #optimizer = torch.optim.Adam([wfe_batch], lr=lr)
+    optimizer = torch.optim.Adam([
+        {'params': [wfe_batch]}, 
+        {'params': p1_model.uncertainty_matrix}
+        ], lr=lr)
+
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=iters, eta_min=1e-20)
     loss_scale = init_est_star_psf.max()
 
@@ -541,10 +491,16 @@ if __name__ == "__main__":
 
         batch_ids = torch.arange(N)
         cur_wfe = wfe_batch[batch_ids]
-        pred_1 = p1_model(plane_wave_1, cur_wfe)
+        
+        if args.loss_fn == 'beta':
+            pred_1, uncertainty_matrix = p1_model(plane_wave_1, cur_wfe)
+        else:
+            pred_1 = p1_model(plane_wave_1, cur_wfe)
 
         if args.loss_fn == 'L2':
             loss = (pred_1 - observations[batch_ids]).pow(2).sum() / loss_scale
+        elif args.loss_fn == 'beta':
+            loss = beta_nll_loss(pred_1, uncertainty_matrix, observations[batch_ids], beta=1.0).sum() / loss_scale + ((pred_1 - observations[batch_ids]).abs().sum() / loss_scale)
         else:
             loss = (pred_1 - observations[batch_ids]).abs().sum() / loss_scale
 
@@ -559,11 +515,22 @@ if __name__ == "__main__":
 
         if i % vis_freq == 0 and i > 0:
             with torch.no_grad():
-                e_pred = p1_model(plane_wave_1, wfe_batch).detach().cpu()
+                if args.loss_fn == 'beta':
+                    e_pred, uncertainty_matrix = p1_model(plane_wave_1, wfe_batch)
+                    e_pred = e_pred.detach().cpu()
+                    uncertainty_matrix = uncertainty_matrix.detach().cpu().numpy()
+                else:
+                    e_pred = p1_model(plane_wave_1, wfe_batch).detach().cpu()
             est_residual = torch.relu(out - e_pred).detach().cpu().numpy()
             est_residual = est_residual / est_residual.max()
             est_residual = np.mean(est_residual, axis=0)
             est_residual = np.uint8(255 * cm.viridis(est_residual))
+            if args.loss_fn == 'beta':
+                fig = plt.figure(figsize=(10, 5))
+                plt.imshow(uncertainty_matrix, cmap='viridis')
+                plt.colorbar()
+                plt.savefig(f'{vis_dir}/uncertainty_{i}.png')
+                plt.close(fig)
             imageio.imsave(f'{vis_dir}/vis_est_res_{i}.png', est_residual)
 
         if args.log_progress:
@@ -581,7 +548,11 @@ if __name__ == "__main__":
                         'FFMPEG', **{'macro_block_size': None, 'ffmpeg_params': ['-s','256x256', '-v', '0'], 'fps': 5, })
 
     with torch.no_grad():
-        est_star_psf = p1_model(plane_wave_1, wfe_batch).detach().cpu().numpy()
+        if args.loss_fn == 'beta':
+            est_star_psf, uncertainty_matrix = p1_model(plane_wave_1, wfe_batch)
+            est_star_psf = est_star_psf.detach().cpu().numpy()
+        else:
+            est_star_psf = p1_model(plane_wave_1, wfe_batch).detach().cpu().numpy()
     true_star_psf = out_1.numpy()
     est_residual_psf = torch.relu(out - est_star_psf).detach().cpu().numpy()
     true_residual_psf = (out - out_1).detach().cpu().numpy()
