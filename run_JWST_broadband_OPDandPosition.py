@@ -50,6 +50,25 @@ def set_rc_params(fontsize=None):
 
 set_rc_params(fontsize=28)
 
+def beta_nll_loss(mean, variance, target, beta=1.0):
+    """Compute beta-NLL loss
+
+    :param mean: Predicted mean of shape B x D
+    :param variance: Predicted variance of shape B x D
+    :param target: Target of shape B x D
+    :param beta: Parameter from range [0, 1] controlling relative
+        weighting between data points, where `0` corresponds to
+        high weight on low error points and `1` to an equal weighting.
+    :returns: Loss per batch element of shape B
+    """
+    loss = 0.5 * ((target - mean) ** 2 / variance + variance.log())
+
+    if beta > 0:
+        loss = loss * (variance.detach() ** beta)
+
+    return loss.sum(axis=-1)
+
+
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -390,7 +409,7 @@ class PointPropagate(nn.Module):
         self.wfe_offsets = OPDOffsetModule(fpm.shape[-2], fpm.shape[-1])
         self.angle_offsets = AngleOffsetModule()
 
-        (npixels, wavelengths, true_pixel_scale, psf_npix, psf_pixel_scale, focal_length, shift, pixel, inverse) = args
+        (npixels, wavelengths, true_pixel_scale, psf_npix, psf_pixel_scale, focal_length, shift, pixel, inverse, beta_loss) = args
         xmats, ymats, mults = [], [], []
         for i in range(len(wavelengths)):
             args = (npixels, wavelengths[i], true_pixel_scale, psf_npix, psf_pixel_scale, focal_length, shift, pixel, inverse)
@@ -399,6 +418,11 @@ class PointPropagate(nn.Module):
         self.x_mat = nn.Parameter(torch.stack(xmats), requires_grad=False)
         self.y_mat = nn.Parameter(torch.stack(ymats), requires_grad=False)
         self.mult = nn.Parameter(torch.stack(mults), requires_grad=False)
+        self.beta_loss = beta_loss
+
+        psf_size = psf_npix
+        if self.beta_loss:
+            self.uncertainty_matrix = nn.Parameter(torch.ones((psf_size, psf_size), dtype=torch.float64), requires_grad=True)
 
 
     def forward(self, wavefront_list, wfe, wl_weights, wavelenghts):
@@ -424,7 +448,11 @@ class PointPropagate(nn.Module):
 
         output = torch.flip(output, dims=(-2,))
 
-        return output
+        if self.beta_loss:
+            uncertainty_matrix = F.softplus(self.uncertainty_matrix)
+            return output, uncertainty_matrix
+        else:
+            return output
 
     def forward_val(self, wavefront):
         phasor = wavefront.get_phasor()
@@ -451,6 +479,7 @@ if __name__ == "__main__":
     parser.add_argument('--star_offset_x', default=0, help='Initial star offset (in pixel)', type=float)
     parser.add_argument('--star_offset_y', default=0, help='Initial star offset (in pixel)', type=float)
     parser.add_argument('--basis', default='zernike', help='Basis for the wavefront', type=str)
+    parser.add_argument('--loss_fn', default='beta', help='Loss function to use', type=str)
     args = parser.parse_args()
 
     DEVICE = 'cuda'
@@ -505,7 +534,9 @@ if __name__ == "__main__":
     inverse = False
     true_pixel_scale = diameter / npixels
     psf_pixel_scale = arcsec2rad(psf_pixel_scale)
-    prop_args = (npixels, wlen_weights[0], true_pixel_scale, psf_npix, psf_pixel_scale, focal_length, shift, pixel, inverse)
+
+    beta_loss = args.loss_fn == 'beta'
+    prop_args = (npixels, wlen_weights[0], true_pixel_scale, psf_npix, psf_pixel_scale, focal_length, shift, pixel, inverse, beta_loss)
 
     # Set up the propagation object
     prop_models = [PointPropagate(aperture, lyot, fpm, nircam_OPD, prop_args).to(DEVICE) for _ in range(1)]
@@ -516,8 +547,14 @@ if __name__ == "__main__":
     
     # Visualize the subtracted PSF using the initial WFE with error
     with torch.no_grad():
-        pred = [p_model(wavefronts_list1, wfe_batch, wlen_weights[1], wlen_weights[0]) for p_model in prop_models]
-        pred = torch.mean(torch.cat(pred, 0), 0)
+        if args.loss_fn == 'beta':
+            results = [p_model(wavefronts_list1, wfe_batch, wlen_weights[1], wlen_weights[0]) for p_model in prop_models]
+            pred, uq = zip(*results)
+            pred = torch.mean(torch.cat(pred, 0), 0)
+            uq = torch.mean(torch.cat(uq, 0), 0)
+        else:
+            pred = [p_model(wavefronts_list1, wfe_batch, wlen_weights[1], wlen_weights[0]) for p_model in prop_models]
+            pred = torch.mean(torch.cat(pred, 0), 0)
     pred_np = pred.cpu().numpy()
     #print(pred_np.shape)
 
@@ -546,7 +583,11 @@ if __name__ == "__main__":
     """
     for p_model in prop_models:
         #optics_params += list(p_model.angle_offsets.parameters()) + list(p_model.nircam_offsets.parameters()) + list(p_model.wfe_offsets.parameters())
-        optics_params += list(p_model.angle_offsets.parameters()) + list(p_model.nircam_offsets.parameters())
+        optics_params += list(p_model.angle_offsets.parameters()) + list(p_model.nircam_offsets.parameters()) + list(p_model.wfe_offsets.parameters()) + [p_model.uncertainty_matrix]
+        if args.basis == 'zernike':
+            for wf in wavefronts_list1:
+                optics_params += list(wf.phase_basis_real.parameters()) + list(wf.phase_basis_complex.parameters())
+    print(f'Number of parameters: {sum([p.numel() for p in optics_params])}')
 
     optimizer = torch.optim.AdamW(optics_params, lr=args.lr, weight_decay=0.0)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.iters, eta_min=args.lr)
@@ -561,13 +602,19 @@ if __name__ == "__main__":
     residual_max_arr = []
     zscore_arr = []
 
+    weighted_progress_arr = []
+
     tbar = tqdm.tqdm(range(args.iters + 1))
     losses = []
     for i in tbar:
         optimizer.zero_grad()
-
-        pred_1 = [p_model(wavefronts_list1, wfe_batch, wlen_weights[1], wlen_weights[0]) for p_model in prop_models]
-        pred_1 = torch.mean(torch.cat(pred_1, 0), 0)[None]
+        if args.loss_fn == 'beta':
+            result = [p_model(wavefronts_list1, wfe_batch, wlen_weights[1], wlen_weights[0]) for p_model in prop_models]
+            pred_1, uq_1 = zip(*result)
+            pred_1, uq_1 = torch.mean(torch.cat(pred_1, 0), 0)[None], torch.mean(torch.cat(uq_1, 0), 0)[None]
+        else:
+            pred_1 = [p_model(wavefronts_list1, wfe_batch, wlen_weights[1], wlen_weights[0]) for p_model in prop_models]
+            pred_1 = torch.mean(torch.cat(pred_1, 0), 0)[None]
         z_score_pred = (pred_1.cpu().detach().numpy() - pred_1.cpu().detach().numpy().mean()) / pred_1.cpu().detach().numpy().std()
         zscore_arr.append(z_score_pred)
 
@@ -578,6 +625,9 @@ if __name__ == "__main__":
         global_l1_loss = F.smooth_l1_loss(pred_scaled, obs_scaled)
         loss = global_l1_loss + center_loss
 
+        if args.loss_fn == 'beta':
+            loss += beta_nll_loss(pred_1, uq_1, obs_scaled, beta=1.0).sum()
+
         loss.backward()
         losses.append(loss.item())
         optimizer.step()
@@ -585,8 +635,13 @@ if __name__ == "__main__":
 
         est_residual = obs_scaled - pred_scaled.detach()
         progress_arr.append(est_residual[0])
+        if args.loss_fn == 'beta':
+            weighted_progress_arr.append(est_residual[0] * (1 / (uq_1 + 1e-8)))
         if i % args.vis_freq == 0 and i > 0:
             plt.imsave(f'{vis_dir}/vis_est_res_{i}.png', progress_arr[-1].cpu().numpy(), cmap='viridis', origin='lower')
+            if args.loss_fn == 'beta':
+                weight_map_detatched = weighted_progress_arr[-1].detach().cpu().numpy()
+                plt.imsave(f'{vis_dir}/weighted_residual_{i}.png', weight_map_detatched, cmap='viridis', origin='lower')
 
         cur_opd = prop_models[0].wfe_offsets.get_res().squeeze().detach().cpu()
         opd_vis_arr.append(cur_opd)
