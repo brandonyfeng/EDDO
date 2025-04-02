@@ -65,7 +65,14 @@ def load_mirror_segment_info(data_dir):
 
     return segments_masks, segment_centers_pixels, segment_idx
 
-
+def total_variation_loss(img):
+    # Compute the total variation loss, for smoothness
+    # horizontal_diff = img[:, :, 1:, :] - img[:, :, :-1, :]
+    # vertical_diff = img[:, 1:, :, :] - img[:, :-1, :, :]
+    horizontal_diff = img[:, 1:, :] - img[:, :-1, :]
+    vertical_diff = img[1:, :, :] - img[:-1, :, :]
+    tv_loss = torch.sum(torch.abs(horizontal_diff)) + torch.sum(torch.abs(vertical_diff))
+    return tv_loss
 
 class ShiftModule(nn.Module):
     def __init__(self, height, width, learn_scale=False):
@@ -427,10 +434,11 @@ if __name__ == "__main__":
     parser.add_argument('--num_det_px', default=80, type=int)
     parser.add_argument('--num_ints', default=1, type=int)
     parser.add_argument('--OPD_loss_weight', default=None, type=float)
+    parser.add_argument('--smooth', default=None, type=float)
+    parser.add_argument('--use_simulated_data', action='store_true')
     args = parser.parse_args()
 
     DEVICE = 'cuda'
-
     # Number of pixels in the wavefront
     wf_npix = 1024
     # Diameter of the aperture
@@ -474,7 +482,7 @@ if __name__ == "__main__":
 
     contrast_normalization = 0.003716380479003919
     sim_to_real_scaling = 2.1722325193439986 # from comparing the simulation with the peak brightness of the real data; VERY ROUGH! To be fixed
-    photons_normalization = 90578.00102527262 * sim_to_real_scaling #THREE CORRECTIONs # mJy/sr
+    photons_normalization = 90578.00102527262 * sim_to_real_scaling *1e4#THREE CORRECTIONs # mJy/sr
     peak_flux_star  = nn.Parameter(torch.FloatTensor([photons_normalization / contrast_normalization]))
 
     offset_STAR = nn.Parameter(torch.FloatTensor([args.star_offset_x * arcsec2rad(psf_pixel_scale), args.star_offset_y * arcsec2rad(psf_pixel_scale)]))
@@ -513,10 +521,10 @@ if __name__ == "__main__":
     reference = real_im
     reference = torch.from_numpy(reference).to(DEVICE)
 
-    print('YES reference median, sum ', reference.detach().median(), reference.detach().sum())
+    # print('YES reference median, sum ', reference.detach().median(), reference.detach().sum())
     ref_scaled = reference / reference.median()
 
-    print('YES ref_scaled median, sum ', ref_scaled.detach().median(), ref_scaled.detach().sum())
+    # print('YES ref_scaled median, sum ', ref_scaled.detach().median(), ref_scaled.detach().sum())
 
     # LOAD REFERENCE IMAGE TOO
     # scale by median before subtraction
@@ -535,8 +543,49 @@ if __name__ == "__main__":
     plt.imsave(f'{vis_dir}/vis_PSF_render_init.png', pred_np, cmap='viridis', origin='lower')
 
 
+    if args.use_simulated_data:
+        with torch.no_grad():
+            # Use interpolated WFE as real WFE
+            # print('peak flux star is ', peak_flux_star)
+            # print('offset star is ', offset_STAR)
+            true_offset = torch.clone(offset_STAR)#1.2106e-07, -2.4211e-07]
+            true_offset[0]+=2e-7
+            true_offset[1]+=1.1e-7
+
+            IEC_RMS1 = np.load('/projects/b1094/rodrigoyeah/optics_jwst/EDDO_repo/EDDO/4050_data_for_diff_modeling/SPIE_modes/IEC_mode_RMS1_1024_meters.npy')
+            IEC_RMS1 = np.flip(IEC_RMS1, axis=0)[None]
+            IEC_RMS1 = torch.from_numpy(IEC_RMS1.copy()).float()
+            IEC_RMS1 = F.interpolate(IEC_RMS1[:, None], size=(wf_npix, wf_npix), mode='bilinear').squeeze()
+            IEC_RMS1 = IEC_RMS1.contiguous().to(DEVICE)
+
+            wavefronts_list_simulated = [Wavefront(wf_npix, diameter, wl, peak_flux_star, true_offset).to(DEVICE) for wl in wlen_weights[0]]
+            wfe_sim_interp = wfe_batch_list[0] + (wfe_batch_list[1] - wfe_batch_list[0]) * 0.5
+            wfe_sim_interp_series = [wfe_sim_interp + (1*IEC_RMS1), wfe_sim_interp + (2*IEC_RMS1)]
+            sim = [prop_models[j](wavefronts_list_simulated, wfe_sim_interp_series[j], wlen_weights[1], wlen_weights[0]) for j in range(len(prop_models))]
+            # print('peak of sim pre mean is ', torch.max(torch.cat(sim)))
+            sim = torch.mean(torch.cat(sim, 0), 0)
+            # print('shape of sim is ', sim)
+            # print('peak is ', torch.max(sim))
+            # print('sqrt peak is ', torch.sqrt(torch.max(sim)))
+            shot_noise = torch.normal(mean = sim, std = 1. * torch.sqrt(sim)) - sim
+            read_noise = torch.normal(mean = 0, std = 42. * torch.ones_like(sim))
+            noise = shot_noise + read_noise
+
+            out_noisy = sim + noise
+            sim = torch.clamp(out_noisy, min=0.0)
+
+            np.save(f'{vis_dir}/simulated_obs_no_planet.npy',sim.detach().cpu().numpy())
+            # Whatever, set observation and reference as the same
+            observations = torch.clone(sim[None])
+            obs_scaled = observations #/ observations.median()
+
+            reference = torch.clone(sim[None]) 
+            ref_scaled = reference #/ reference.median()
+
+
     pred_scaled = pred / pred.median()
     est_residual = (obs_scaled - pred_scaled).detach().cpu().mean(0).numpy()
+    print('est residual shape is ', est_residual.shape)
     plt.imsave(f'{vis_dir}/vis_est_res_init.png', est_residual, cmap='viridis', origin='lower')
 
     est_ref_residual = (obs_scaled - ref_scaled).detach().cpu().mean(0).numpy()
@@ -558,7 +607,7 @@ if __name__ == "__main__":
     nircam_offsets: learns to offset the nircam opd
     """
     for p_model in prop_models:
-        optics_params += list(p_model.angle_offsets.parameters()) + list(p_model.nircam_offsets.parameters()) + list(p_model.wfe_offsets.parameters()) + list(p_model.flux_correction.parameters())
+        optics_params += list(p_model.angle_offsets.parameters()) + list(p_model.nircam_offsets.parameters()) + list(p_model.wfe_offsets.parameters()) #+ list(p_model.flux_correction.parameters())
         if args.fit_everything:
             optics_params+= list(p_model.fpm_shifts.parameters()) + list(p_model.lyot_shifts.parameters()) + list(p_model.flux_correction.parameters())
 
@@ -574,15 +623,22 @@ if __name__ == "__main__":
 
     progress_arr_reference = []
     opd_vis_arr = []
+    opd_vis_offset_arr = []
     if args.num_ints > 1:
         opd_vis_arr1 = []
+        opd_vis_offset_arr_1 = []
         # opd_vis_arr2 = []
     nircam_opd_vis_arr = []
+    nircam_opd_vis_arr_1 = []
+
+    angles_offset_res = []
+    angles_offset_res_1 = []
+
     residual_max_arr = []
 
     progress_arr_target = []
 
-    cutoff_iter = args.iters -1
+    cutoff_iter = args.iters +10
 
     tbar = tqdm.tqdm(range(args.iters + 1))
     for i in tbar:
@@ -595,7 +651,7 @@ if __name__ == "__main__":
         #     print('YES pred_1 median, sum ', pred_1.detach().median(), pred_1.detach().sum())
 
         # compute loss in median-scaled space
-        pred_scaled = pred_1 / pred_1.detach().median()
+        pred_scaled = pred_1 #/ pred_1.detach().median()
         # if i%100==0:
         #     print('YES pred_scaled median, sum ', pred_scaled.detach().median(), pred_scaled.detach().sum())
         est_residual_obs = obs_scaled - pred_scaled.detach()
@@ -614,6 +670,20 @@ if __name__ == "__main__":
             loss = 0.001*obs_l1_loss
         else:
             loss = global_l1_loss
+
+        if args.smooth is not None:
+            opd1 = prop_models[0].wfe_offsets.forward(wfe_batch_list[0])
+            opd2 = prop_models[1].wfe_offsets.forward(wfe_batch_list[1])
+
+            TVL = (total_variation_loss(opd1) + total_variation_loss(opd2))/2.
+
+            if i > cutoff_iter:
+                # loss = 0.001*obs_l1_loss
+                loss = loss + args.smooth * TVL
+            else:
+                loss = loss + args.smooth * TVL
+
+
 
         if args.num_ints > 1 and args.OPD_loss_weight is not None:
             opd1 = prop_models[0].wfe_offsets.forward(wfe_batch_list[0])
@@ -686,15 +756,25 @@ if __name__ == "__main__":
         
         cur_opd = prop_models[0].wfe_offsets.forward(wfe_batch_list[0]).squeeze().detach().cpu()
         opd_vis_arr.append(cur_opd)
+
+        opd_vis_offset_arr.append(prop_models[0].wfe_offsets.get_res().squeeze().detach().cpu())
+        angles_offset_res.append(prop_models[0].angle_offsets())
         if args.num_ints > 1:
             cur_opd = prop_models[1].wfe_offsets.forward(wfe_batch_list[1]).squeeze().detach().cpu()
             opd_vis_arr1.append(cur_opd)
+
+            angles_offset_res_1.append(prop_models[1].angle_offsets())
+
+            opd_vis_offset_arr_1.append(prop_models[1].wfe_offsets.get_res().squeeze().detach().cpu())
 
             # cur_opd = prop_models[2].wfe_offsets.get_res().squeeze().detach().cpu()
             # opd_vis_arr2.append(cur_opd)
 
         curr_nircam_opd = prop_models[0].nircam_offsets.get_res().squeeze().detach().cpu()
         nircam_opd_vis_arr.append(curr_nircam_opd)
+
+        curr_nircam_opd_1 = prop_models[1].nircam_offsets.get_res().squeeze().detach().cpu()
+        nircam_opd_vis_arr_1.append(curr_nircam_opd_1)
         tbar_out = {'loss': global_l1_loss.item()}
         tbar.set_postfix(tbar_out)
 
@@ -708,10 +788,20 @@ if __name__ == "__main__":
     psf_pixel_scale = 0.062424185
     target_numpys = np.squeeze(torch.stack(progress_arr_target).cpu().numpy())
     opd_vis_arr_numpys = np.squeeze(opd_vis_arr[-1].cpu().numpy())
+
+    opd_vis_offset_arr_numpys = np.squeeze(opd_vis_offset_arr[-1].cpu().numpy())
+
+    reference_numpys = np.squeeze(torch.stack(progress_arr_reference).cpu().numpy())
+
+    angles_offset_res_numpys = np.squeeze(angles_offset_res[-1].detach().cpu().numpy())
     if args.num_ints > 1:
         opd_vis_arr_numpys1 = np.squeeze(opd_vis_arr1[-1].cpu().numpy())
+        angles_offset_res_numpys_1 = np.squeeze(angles_offset_res_1[-1].detach().cpu().numpy())
+        opd_vis_offset_arr_numpys_1 = np.squeeze(opd_vis_offset_arr_1[-1].cpu().numpy())
         # opd_vis_arr_numpys2 = np.squeeze(opd_vis_arr2[-1].cpu().numpy())
     nircam_opd_vis_arr_numpys = np.squeeze(nircam_opd_vis_arr[-1].cpu().numpy())
+    if args.num_ints > 1:
+        nircam_opd_vis_arr_1_numpys = np.squeeze(nircam_opd_vis_arr_1[-1].cpu().numpy())
 
     opd_vis_arr_numpys_initial = np.squeeze(opd_vis_arr[0].cpu().numpy())
     if args.num_ints > 1:
@@ -720,10 +810,19 @@ if __name__ == "__main__":
     nircam_opd_vis_arr_numpys_initial = np.squeeze(nircam_opd_vis_arr[0].cpu().numpy())
 
     np.save(f'{vis_dir}/last_iteration_ENTRANCE_OPD_oversample_{args.oversample}_wl_sampling_{args.num_wl}.npy',opd_vis_arr_numpys)
+    np.save(f'{vis_dir}/last_iteration_ENTRANCE_OPD_OFFSET_oversample_{args.oversample}_wl_sampling_{args.num_wl}.npy',opd_vis_offset_arr_numpys)
+
+    np.save(f'{vis_dir}/last_iteration_ANGLES_OFFSET_oversample_{args.oversample}_wl_sampling_{args.num_wl}.npy',angles_offset_res_numpys)
+
     if args.num_ints > 1:
         np.save(f'{vis_dir}/last_iteration_ENTRANCE_OPD_oversample_{args.oversample}_wl_sampling_{args.num_wl}_1.npy',opd_vis_arr_numpys1)
+        np.save(f'{vis_dir}/last_iteration_ANGLES_OFFSET_oversample_{args.oversample}_wl_sampling_{args.num_wl}_1.npy',angles_offset_res_numpys_1)
+        np.save(f'{vis_dir}/last_iteration_ENTRANCE_OPD_OFFSET_oversample_{args.oversample}_wl_sampling_{args.num_wl}_1.npy',opd_vis_offset_arr_numpys_1)
         # np.save(f'{vis_dir}/last_iteration_ENTRANCE_OPD_oversample_{args.oversample}_wl_sampling_{args.num_wl}_2.npy',opd_vis_arr_numpys2)
     np.save(f'{vis_dir}/last_iteration_NIRCAM_OPD_oversample_{args.oversample}_wl_sampling_{args.num_wl}.npy',nircam_opd_vis_arr_numpys)
+    if args.num_ints > 1:
+        np.save(f'{vis_dir}/last_iteration_NIRCAM_OPD_oversample_{args.oversample}_wl_sampling_{args.num_wl}_1.npy',nircam_opd_vis_arr_1_numpys)
+        
 
     np.save(f'{vis_dir}/first_iteration_ENTRANCE_OPD_oversample_{args.oversample}_wl_sampling_{args.num_wl}.npy',opd_vis_arr_numpys_initial)
     if args.num_ints > 1:
@@ -735,35 +834,37 @@ if __name__ == "__main__":
     x_pos_real, y_pos_real = -6.5 * psf_pixel_scale, 11 * psf_pixel_scale # hand tuned for HIP 65426 in the pre-rotated frame
     # print('-------circular mask')
     # masked_residual = circular_mask(residual, x_pos_real, y_pos_real, 0.95, np.nan)
-    snr_list = []
-    for i in range(len(target_numpys)):
-        curr_snr, _, _ = calc_snr(target_numpys[i], x_pos_real, y_pos_real,0.98,np.sqrt(x_pos_real**2 + y_pos_real**2),width=0.5)
-        snr_list.append(curr_snr)
+    # snr_list = []
+    # for i in range(len(target_numpys)):
+    #     curr_snr, _, _ = calc_snr(target_numpys[i], x_pos_real, y_pos_real,0.98,np.sqrt(x_pos_real**2 + y_pos_real**2),width=0.5)
+    #     snr_list.append(curr_snr)
     
-    _, annulus, signal_blob = calc_snr(target_numpys[-1], x_pos_real, y_pos_real,0.98,np.sqrt(x_pos_real**2 + y_pos_real**2), width=0.5)
-    plt.figure()
-    plt.subplot(121)
-    plt.imshow(annulus, origin='lower')
+    # _, annulus, signal_blob = calc_snr(target_numpys[-1], x_pos_real, y_pos_real,0.98,np.sqrt(x_pos_real**2 + y_pos_real**2), width=0.5)
+    # plt.figure()
+    # plt.subplot(121)
+    # plt.imshow(annulus, origin='lower')
 
-    plt.subplot(122)
-    plt.imshow(signal_blob, origin='lower')
+    # plt.subplot(122)
+    # plt.imshow(signal_blob, origin='lower')
 
-    plt.tight_layout()
-    plt.savefig(f'{vis_dir}/target_final_snr_annulus.png')
-    plt.close()
-    peak_snr = np.nanmax(np.array(snr_list))
-    plt.figure()
-    plt.plot(snr_list)
-    plt.xlabel('Iterations')
-    plt.ylabel('SNR')
-    plt.grid()
-    plt.title(f'Oversample={args.oversample}, Wavelength sampling={args.num_wl}, max SNR = {peak_snr:.2f}')
-    plt.savefig(f'{vis_dir}/snrs_iterations.png')
-    plt.close()
+    # plt.tight_layout()
+    # plt.savefig(f'{vis_dir}/target_final_snr_annulus.png')
+    # plt.close()
+    # peak_snr = np.nanmax(np.array(snr_list))
+    # plt.figure()
+    # plt.plot(snr_list)
+    # plt.xlabel('Iterations')
+    # plt.ylabel('SNR')
+    # plt.grid()
+    # plt.title(f'Oversample={args.oversample}, Wavelength sampling={args.num_wl}, max SNR = {peak_snr:.2f}')
+    # plt.savefig(f'{vis_dir}/snrs_iterations.png')
+    # plt.close()
 
-    np.save(f'{vis_dir}/snrs_iterations_oversample_{args.oversample}_wl_sampling_{args.num_wl}.npy', np.array(snr_list))
+    # np.save(f'{vis_dir}/snrs_iterations_oversample_{args.oversample}_wl_sampling_{args.num_wl}.npy', np.array(snr_list))
     np.save(f'{vis_dir}/last_iteration_oversample_{args.oversample}_wl_sampling_{args.num_wl}.npy', target_numpys[-1])
-    np.save(f'{vis_dir}/max_snr_iteration_oversample_{args.oversample}_wl_sampling_{args.num_wl}.npy', target_numpys[np.array(snr_list).argmax()])
+    np.save(f'{vis_dir}/last_iteration_REFERENCE_oversample_{args.oversample}_wl_sampling_{args.num_wl}.npy', reference_numpys[-1])
+    
+    # np.save(f'{vis_dir}/max_snr_iteration_oversample_{args.oversample}_wl_sampling_{args.num_wl}.npy', target_numpys[np.array(snr_list).argmax()])
 
 
     progress_arr = torch.stack(progress_arr_target).cpu().numpy()[::5]
