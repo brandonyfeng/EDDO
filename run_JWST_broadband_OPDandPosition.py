@@ -10,6 +10,7 @@ from matplotlib import rcParams, rc
 from matplotlib.gridspec import GridSpec
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from torch.nn.utils import parameters_to_vector, vector_to_parameters
+import torch.distributions as dist
 
 def set_rc_params(fontsize=None):
     '''
@@ -50,7 +51,74 @@ def set_rc_params(fontsize=None):
 
 set_rc_params(fontsize=28)
 
-def beta_nll_loss(mean, variance, target, beta=1.0):
+def tilted_loss(q, e):
+    return torch.max(q * e, (q - 1) * e)
+
+def np_tilted_loss(q, e):
+    return np.maximum(q * e, (q - 1) * e)
+
+
+def NIG_NLL(y, gamma, v, alpha, beta, w_i_dis, quantile, reduce=True):
+    tau_two = 2.0 / (quantile * (1.0 - quantile))  # Scalar
+    twoBlambda = 2.0 * 2.0 * beta * (1.0 + tau_two * w_i_dis.mean(dim=1, keepdim=True) * v)  # Shape: [batch_size, dimension]
+    nll = (
+        0.5 * torch.log(np.pi / v)  # Shape: [batch_size, dimension]
+        - alpha * torch.log(twoBlambda)  # Shape: [batch_size, dimension]
+        + (alpha + 0.5) * torch.log(v * (y - gamma) ** 2 + twoBlambda)  # Shape: [batch_size, dimension]
+        + torch.lgamma(alpha)  # Shape: [batch_size, dimension]
+        - torch.lgamma(alpha + 0.5)  # Shape: [batch_size, dimension]
+    )
+    per_element_loss = nll.sum(dim=1)  # Sum over dimensions for each batch element
+    return per_element_loss.mean() if reduce else per_element_loss
+
+
+def KL_NIG(gamma, v, alpha, beta, gamma_p, omega_p, v_p, beta_p):
+    raise NotImplementedError("KL_NIG function is not implemented")
+
+def NIG_Reg(y, gamma, v, alpha, beta, w_i_dis, quantile, omega=0.01, reduce=True, kl=False):
+    error = tilted_loss(quantile, y - gamma)  # Shape: [batch_size, dimension]
+    w = abs(quantile - 0.5)  # Scalar weight based on quantile
+    if kl:
+        kl_div = KL_NIG(
+            gamma, v, alpha, beta,
+            gamma, omega, 1 + omega, beta
+        )  # Shape: [batch_size, dimension]
+        reg = error * kl_div  # Shape: [batch_size, dimension]
+    else:
+        evi = 2 * v + alpha + 1 / beta  # Shape: [batch_size, dimension]
+        reg = error * evi  # Shape: [batch_size, dimension]
+    per_element_loss = reg.sum(dim=1)  # Sum over dimensions for each batch element
+    return per_element_loss.mean() if reduce else per_element_loss
+
+def quant_evi_loss(y_true, gamma, v, alpha, beta, quantile, coeff=1.0, reduce=True):
+    theta = (1.0 - 2.0 * quantile) / (quantile * (1.0 - quantile))  # Scalar
+    mean_ = beta / (alpha - 1)  # Shape: [batch_size, dimension]
+    rate = 1 / (mean_ + 1e-8)
+    if torch.any(rate <= 0):
+        print("Found non-positive rate values in Exponential distribution")
+        print("rate min:", rate.min())
+        print("rate max:", rate.max())
+        print("mean_ min:", mean_.min())
+        print("mean_ max:", mean_.max())
+        print("alpha max:", alpha.max())
+        print("alpha min:", alpha.min())
+        print("beta max:", beta.max())
+        print("beta min:", beta.min())
+
+    if torch.any(mean_ <= 1e-8):
+        print("Warning: Clipping mean_ values to 1e-8 to avoid invalid rates in the exponential distribution.")
+    max_mean_value = 1e10
+    mean_ = torch.clamp(mean_, min=1e-8, max=max_mean_value)
+    exp_dist = dist.Exponential(rate=1 / mean_ )  # Shape: [batch_size, dimension]
+    w_i_dis = exp_dist.sample()
+    mu = gamma + theta * w_i_dis.mean(dim=1, keepdim=True)  # Shape: [batch_size, dimension]
+
+    loss_nll = NIG_NLL(y_true, mu, v, alpha, beta, w_i_dis, quantile, reduce=reduce)
+    loss_reg = NIG_Reg(y_true, gamma, v, alpha, beta, w_i_dis, quantile, reduce=reduce)
+
+    return loss_nll + coeff * loss_reg
+
+def beta_nll_loss(mean, variance, target, beta=0.5):
     """Compute beta-NLL loss
 
     :param mean: Predicted mean of shape B x D
@@ -409,7 +477,7 @@ class PointPropagate(nn.Module):
         self.wfe_offsets = OPDOffsetModule(fpm.shape[-2], fpm.shape[-1])
         self.angle_offsets = AngleOffsetModule()
 
-        (npixels, wavelengths, true_pixel_scale, psf_npix, psf_pixel_scale, focal_length, shift, pixel, inverse, beta_loss) = args
+        (npixels, wavelengths, true_pixel_scale, psf_npix, psf_pixel_scale, focal_length, shift, pixel, inverse, beta_loss, nig_loss) = args
         xmats, ymats, mults = [], [], []
         for i in range(len(wavelengths)):
             args = (npixels, wavelengths[i], true_pixel_scale, psf_npix, psf_pixel_scale, focal_length, shift, pixel, inverse)
@@ -419,10 +487,15 @@ class PointPropagate(nn.Module):
         self.y_mat = nn.Parameter(torch.stack(ymats), requires_grad=False)
         self.mult = nn.Parameter(torch.stack(mults), requires_grad=False)
         self.beta_loss = beta_loss
+        self.nig_loss = nig_loss
 
         psf_size = psf_npix
         if self.beta_loss:
             self.uncertainty_matrix = nn.Parameter(torch.ones((psf_size, psf_size), dtype=torch.float64), requires_grad=True)
+        if self.nig_loss:
+            self.alpha = nn.Parameter(torch.ones((psf_size, psf_size), dtype=torch.float64), requires_grad=True)
+            self.beta = nn.Parameter(torch.ones((psf_size, psf_size), dtype=torch.float64), requires_grad=True)
+            self.v = nn.Parameter(torch.ones((psf_size, psf_size), dtype=torch.float64), requires_grad=True)
 
 
     def forward(self, wavefront_list, wfe, wl_weights, wavelenghts):
@@ -451,6 +524,14 @@ class PointPropagate(nn.Module):
         if self.beta_loss:
             uncertainty_matrix = F.softplus(self.uncertainty_matrix)
             return output, uncertainty_matrix
+        elif self.nig_loss:
+            v_output =  F.softplus(self.v)
+            alpha_output = F.softplus(self.alpha) + 1
+            beta_output = F.softplus(self.beta) 
+            al_uq = beta_output / (alpha_output - 1)
+            ep_uq = beta_output / ((alpha_output - 1) * v_output)
+            # gamma = image
+            return output, v_output, alpha_output, beta_output, al_uq, ep_uq
         else:
             return output
 
@@ -479,7 +560,7 @@ if __name__ == "__main__":
     parser.add_argument('--star_offset_x', default=0, help='Initial star offset (in pixel)', type=float)
     parser.add_argument('--star_offset_y', default=0, help='Initial star offset (in pixel)', type=float)
     parser.add_argument('--basis', default='zernike', help='Basis for the wavefront', type=str)
-    parser.add_argument('--loss_fn', default='beta', help='Loss function to use', type=str)
+    parser.add_argument('--loss_fn', default='l1', help='Loss function to use', type=str)
     args = parser.parse_args()
 
     DEVICE = 'cuda'
@@ -536,7 +617,8 @@ if __name__ == "__main__":
     psf_pixel_scale = arcsec2rad(psf_pixel_scale)
 
     beta_loss = args.loss_fn == 'beta'
-    prop_args = (npixels, wlen_weights[0], true_pixel_scale, psf_npix, psf_pixel_scale, focal_length, shift, pixel, inverse, beta_loss)
+    nig_loss = args.loss_fn == 'NIG'
+    prop_args = (npixels, wlen_weights[0], true_pixel_scale, psf_npix, psf_pixel_scale, focal_length, shift, pixel, inverse, beta_loss, nig_loss)
 
     # Set up the propagation object
     prop_models = [PointPropagate(aperture, lyot, fpm, nircam_OPD, prop_args).to(DEVICE) for _ in range(1)]
@@ -552,6 +634,21 @@ if __name__ == "__main__":
             pred, uq = zip(*results)
             pred = torch.mean(torch.cat(pred, 0), 0)
             uq = torch.mean(torch.cat(uq, 0), 0)
+        elif args.loss_fn == 'NIG':
+            results = [p_model(wavefronts_list1, wfe_batch, wlen_weights[1], wlen_weights[0]) for p_model in prop_models]
+            pred, v, alpha, beta, al_uq, ep_uq = zip(*results) # pred = gamma
+            #pred = torch.mean(torch.cat(pred, 0), 0)
+            #v = torch.mean(torch.cat(v, 0), 0)
+            #alpha = torch.mean(torch.cat(alpha, 0), 0)
+            #beta = torch.mean(torch.cat(beta, 0), 0)
+            #al_uq = torch.mean(torch.cat(al_uq, 0), 0)
+            #ep_uq = torch.mean(torch.cat(ep_uq, 0), 0)
+            pred   = torch.stack(pred,   0).mean(0)[None]   # shape (1, H, W)
+            v      = torch.stack(v,      0).mean(0)[None]
+            alpha  = torch.stack(alpha,  0).mean(0)[None]
+            beta   = torch.stack(beta,   0).mean(0)[None]
+            al_uq  = torch.stack(al_uq,  0).mean(0)[None]   # ← fixed
+            ep_uq  = torch.stack(ep_uq,  0).mean(0)[None]
         else:
             pred = [p_model(wavefronts_list1, wfe_batch, wlen_weights[1], wlen_weights[0]) for p_model in prop_models]
             pred = torch.mean(torch.cat(pred, 0), 0)
@@ -570,7 +667,7 @@ if __name__ == "__main__":
     obs_scaled = observations / observations.median()
     pred_scaled = pred / pred.median()
     est_residual = (obs_scaled - pred_scaled).detach().cpu().mean(0).numpy()
-    plt.imsave(f'{vis_dir}/vis_est_res_init.png', est_residual, cmap='viridis', origin='lower')
+    plt.imsave(f'{vis_dir}/vis_est_res_init.png', np.squeeze(est_residual), cmap='viridis', origin='lower')
 
     # Set up the optimizer and scheduler
     optics_params = list()
@@ -582,8 +679,12 @@ if __name__ == "__main__":
     nircam_offsets: learns to offset the nircam opd
     """
     for p_model in prop_models:
-        #optics_params += list(p_model.angle_offsets.parameters()) + list(p_model.nircam_offsets.parameters()) + list(p_model.wfe_offsets.parameters())
-        optics_params += list(p_model.angle_offsets.parameters()) + list(p_model.nircam_offsets.parameters()) + list(p_model.wfe_offsets.parameters()) + [p_model.uncertainty_matrix]
+        if args.loss_fn == 'beta':
+            optics_params += list(p_model.angle_offsets.parameters()) + list(p_model.nircam_offsets.parameters()) + list(p_model.wfe_offsets.parameters()) + [p_model.uncertainty_matrix]
+        elif args.loss_fn == 'NIG':
+            optics_params += list(p_model.angle_offsets.parameters()) + list(p_model.nircam_offsets.parameters()) + list(p_model.wfe_offsets.parameters()) + [p_model.alpha, p_model.beta, p_model.v]
+        else:
+            optics_params += list(p_model.angle_offsets.parameters()) + list(p_model.nircam_offsets.parameters()) + list(p_model.wfe_offsets.parameters())
         if args.basis == 'zernike':
             for wf in wavefronts_list1:
                 optics_params += list(wf.phase_basis_real.parameters()) + list(wf.phase_basis_complex.parameters())
@@ -603,6 +704,8 @@ if __name__ == "__main__":
     zscore_arr = []
 
     weighted_progress_arr = []
+    ep_weighted_progress_arr = []
+    al_weighted_progress_arr = []
 
     tbar = tqdm.tqdm(range(args.iters + 1))
     losses = []
@@ -612,6 +715,21 @@ if __name__ == "__main__":
             result = [p_model(wavefronts_list1, wfe_batch, wlen_weights[1], wlen_weights[0]) for p_model in prop_models]
             pred_1, uq_1 = zip(*result)
             pred_1, uq_1 = torch.mean(torch.cat(pred_1, 0), 0)[None], torch.mean(torch.cat(uq_1, 0), 0)[None]
+        elif args.loss_fn == 'NIG':
+            result = [p_model(wavefronts_list1, wfe_batch, wlen_weights[1], wlen_weights[0]) for p_model in prop_models]
+            pred_1, v_1, alpha_1, beta_1, al_uq_1, ep_uq_1 = zip(*result)
+            pred_1   = torch.stack(pred_1,   0).mean(0)   # shape (1, H, W)
+            v_1      = torch.stack(v_1,      0).mean(0)
+            alpha_1  = torch.stack(alpha_1,  0).mean(0)
+            beta_1   = torch.stack(beta_1,   0).mean(0)
+            al_uq_1  = torch.stack(al_uq_1,  0).mean(0)   # ← fixed
+            ep_uq_1  = torch.stack(ep_uq_1,  0).mean(0)
+            #pred_1 = torch.mean(torch.cat(pred_1, 0), 0)[None]
+            #v_1 = torch.mean(torch.cat(v_1, 0), 0)[None]
+            #alpha_1 = torch.mean(torch.cat(alpha_1, 0), 0)[None]
+            #beta_1 = torch.mean(torch.cat(beta_1, 0), 0)[None]
+            #al_uq_1 = torch.mean(torch.cat(al_uq_1, 0), 0)[None]
+            #ep_uq_1 = torch.mean(torch.cat(ep_uq_1, 0), 0)[None]
         else:
             pred_1 = [p_model(wavefronts_list1, wfe_batch, wlen_weights[1], wlen_weights[0]) for p_model in prop_models]
             pred_1 = torch.mean(torch.cat(pred_1, 0), 0)[None]
@@ -627,6 +745,8 @@ if __name__ == "__main__":
 
         if args.loss_fn == 'beta':
             loss += beta_nll_loss(pred_1, uq_1, obs_scaled, beta=1.0).sum()
+        elif args.loss_fn == 'NIG':
+            loss += quant_evi_loss(obs_scaled, pred_1, v_1, alpha_1, beta_1, 0.5, coeff=1.0, reduce=True).sum()
 
         loss.backward()
         losses.append(loss.item())
@@ -637,11 +757,30 @@ if __name__ == "__main__":
         progress_arr.append(est_residual[0])
         if args.loss_fn == 'beta':
             weighted_progress_arr.append(est_residual[0] * (1 / (uq_1 + 1e-8)))
+        elif args.loss_fn == 'NIG':
+            weighted_progress_arr.append(est_residual[0] * (1 / (al_uq_1 + 1e-8)))
+            ep_weighted_progress_arr.append(ep_uq_1)
+            al_weighted_progress_arr.append(al_uq_1)
         if i % args.vis_freq == 0 and i > 0:
             plt.imsave(f'{vis_dir}/vis_est_res_{i}.png', progress_arr[-1].cpu().numpy(), cmap='viridis', origin='lower')
             if args.loss_fn == 'beta':
                 weight_map_detatched = weighted_progress_arr[-1].detach().cpu().numpy()
                 plt.imsave(f'{vis_dir}/weighted_residual_{i}.png', weight_map_detatched, cmap='viridis', origin='lower')
+            elif args.loss_fn == 'NIG':
+                weight_map_detatched = weighted_progress_arr[-1].detach().cpu().numpy()
+                plt.imsave(f'{vis_dir}/weighted_residual_{i}.png', weight_map_detatched, cmap='viridis', origin='lower')
+                print(ep_weighted_progress_arr[-1].shape)
+                img_ep_weighted_progress_arr = ep_weighted_progress_arr[-1].squeeze(0).detach().cpu().numpy()
+                img_ep_weighted_progress_arr = np.ascontiguousarray(img_ep_weighted_progress_arr)
+                img_al_weighted_progress_arr = al_weighted_progress_arr[-1].squeeze(0).detach().cpu().numpy()
+                img_al_weighted_progress_arr = np.ascontiguousarray(img_al_weighted_progress_arr)
+                fig, ax = plt.subplots(1, 2, sharey=True, figsize=(10, 5), tight_layout=True)
+                ax[0].imshow(img_ep_weighted_progress_arr, cmap='viridis', origin='lower')
+                ax[1].imshow(img_al_weighted_progress_arr, cmap='viridis', origin='lower')
+                ax[0].set_title('ep_uq')
+                ax[1].set_title('al_uq')
+                plt.savefig(f'{vis_dir}/uq_{i}.png')
+                plt.close()
 
         cur_opd = prop_models[0].wfe_offsets.get_res().squeeze().detach().cpu()
         opd_vis_arr.append(cur_opd)
