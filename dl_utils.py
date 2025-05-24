@@ -310,15 +310,17 @@ def rad2arcsec(values):
 
 
 def mask_annulus(im, radius,width=0.3):
-    x = np.linspace(-40 * 0.062424185, 40 * 0.062424185, 80)
-    y = np.linspace(-40 * 0.062424185, 40 * 0.062424185, 80)
+    size = im.shape[-1]
+    x = np.linspace(-int(size/2) * 0.062424185, int(size/2) * 0.062424185, size)
+    y = np.linspace(-int(size/2) * 0.062424185, int(size/2)* 0.062424185, size)
     mesh = np.meshgrid(x,y)
     annulus = np.where((mesh[0]**2 + mesh[1]**2 > (radius-width)**2)&(mesh[0]**2 + mesh[1]**2 < (radius+width)**2), im, np.nan)
     return annulus
 
 def circular_mask(im, peak_x,peak_y, rad_to_mask, value_to_mask, mask_inside=True):
-    x = np.linspace(-40 * 0.062424185, 40 * 0.062424185, 80)
-    y = np.linspace(-40 * 0.062424185, 40 * 0.062424185, 80)
+    size = im.shape[-1]
+    x = np.linspace(-int(size/2) * 0.062424185, int(size/2) * 0.062424185, size)
+    y = np.linspace(-int(size/2) * 0.062424185, int(size/2)* 0.062424185, size)
     mesh = np.meshgrid(x,y)
     if mask_inside:
         circlito = np.where(((mesh[0] - peak_x)**2 + (mesh[1]-peak_y)**2 < rad_to_mask**2), value_to_mask, im)
@@ -335,12 +337,18 @@ def circular_mask(im, peak_x,peak_y, rad_to_mask, value_to_mask, mask_inside=Tru
 #     circlito = np.where(((mesh[0] - peakpix_x)**2 + (mesh[1]-peakpix_y)**2 < rad**2), im, np.nan)
 #     return circlito
 
-def calc_snr(im, offset_x,offset_y, rad_blob, rad_ann, width=0.3):
-    im = nan_gaussian_filter(im, 3./2.335)
-    positive_blob = circular_mask(im, offset_x,offset_y, rad_blob, np.nan, mask_inside=False)
+def calc_snr(im, offset_x,offset_y, rad_blob, rad_ann, width=0.3, blur_before_signal=False):
+    if blur_before_signal:
+        im = nan_gaussian_filter(im, 3./2.335)
+        positive_blob = circular_mask(im, offset_x,offset_y, rad_blob, np.nan, mask_inside=False)
+    else:
+        positive_blob = circular_mask(im, offset_x,offset_y, rad_blob, np.nan, mask_inside=False)
+        im = nan_gaussian_filter(im, 3./2.335)
     # positive_blob = nan_gaussian_filter(positive_blob, 3)
+    # signal = np.nanmax(positive_blob)
     signal = np.nanmax(positive_blob)
     positive_annulus = mask_annulus(im, rad_ann, width)
+    # valid_annulus = np.where((~np.isnan(positive_annulus)&(np.isnan(positive_blob))), positive_annulus, np.nan)
     valid_annulus = np.where((~np.isnan(positive_annulus)&(np.isnan(positive_blob))), positive_annulus, np.nan)
     # valid_annulus = nan_gaussian_filter(valid_annulus, 3./2.335)
     # valid_annulus = nan_gaussian_filter(valid_annulus, 3)
