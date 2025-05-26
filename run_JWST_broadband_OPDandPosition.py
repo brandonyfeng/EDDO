@@ -763,6 +763,7 @@ if __name__ == "__main__":
             al_weighted_progress_arr.append(al_uq_1)
         if i % args.vis_freq == 0 and i > 0:
             plt.imsave(f'{vis_dir}/vis_est_res_{i}.png', progress_arr[-1].cpu().numpy(), cmap='viridis', origin='lower')
+            np.save(f'{vis_dir}/progress_{i}.npy', progress_arr[-1].cpu().numpy())
             if args.loss_fn == 'beta':
                 weight_map_detatched = weighted_progress_arr[-1].detach().cpu().numpy()
                 plt.imsave(f'{vis_dir}/weighted_residual_{i}.png', weight_map_detatched, cmap='viridis', origin='lower')
@@ -774,13 +775,17 @@ if __name__ == "__main__":
                 img_ep_weighted_progress_arr = np.ascontiguousarray(img_ep_weighted_progress_arr)
                 img_al_weighted_progress_arr = al_weighted_progress_arr[-1].squeeze(0).detach().cpu().numpy()
                 img_al_weighted_progress_arr = np.ascontiguousarray(img_al_weighted_progress_arr)
+
                 fig, ax = plt.subplots(1, 2, sharey=True, figsize=(10, 5), tight_layout=True)
                 ax[0].imshow(img_ep_weighted_progress_arr, cmap='viridis', origin='lower')
                 ax[1].imshow(img_al_weighted_progress_arr, cmap='viridis', origin='lower')
-                ax[0].set_title('ep_uq')
-                ax[1].set_title('al_uq')
+                ax[0].set_title('Epistemic Uncertainty')
+                ax[1].set_title('Aleatoric Uncertainty')
                 plt.savefig(f'{vis_dir}/uq_{i}.png')
                 plt.close()
+                np.save(f'{vis_dir}/ep_uq_{i}.npy', img_ep_weighted_progress_arr)
+                np.save(f'{vis_dir}/al_uq_{i}.npy', img_al_weighted_progress_arr)
+                np.save(f'{vis_dir}/weighted_progress_{i}.npy', weight_map_detatched)
 
         cur_opd = prop_models[0].wfe_offsets.get_res().squeeze().detach().cpu()
         opd_vis_arr.append(cur_opd)
