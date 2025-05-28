@@ -69,8 +69,11 @@ def total_variation_loss(img):
     # Compute the total variation loss, for smoothness
     # horizontal_diff = img[:, :, 1:, :] - img[:, :, :-1, :]
     # vertical_diff = img[:, 1:, :, :] - img[:, :-1, :, :]
+    # horizontal_diff = img[:, 1:, :] - img[:, :-1, :]
+    # vertical_diff = img[1:, :, :] - img[:-1, :, :]
+    # TEST TO SEE IF THIS MAKES SENSE
     horizontal_diff = img[:, 1:, :] - img[:, :-1, :]
-    vertical_diff = img[1:, :, :] - img[:-1, :, :]
+    vertical_diff = img[:, :, 1:] - img[:, :, :-1]
     tv_loss = torch.sum(torch.abs(horizontal_diff)) + torch.sum(torch.abs(vertical_diff))
     return tv_loss
 
@@ -150,12 +153,24 @@ class OPDOffsetModule(nn.Module):
         return out
 
 class FluxOffsetModule(nn.Module):
-    def __init__(self):
+    def __init__(self, flux=None):
         super().__init__()
-        self.data = nn.Parameter(torch.zeros(1), requires_grad=True)
+        # self.data = nn.Parameter(torch.ones(1), requires_grad=True)
+        if flux is None:
+            self.data = nn.Parameter(torch.ones(1), requires_grad=True)
+        else:
+            self.data = nn.Parameter(flux, requires_grad=True)
 
-    def forward(self):
-        return self.data
+    def forward(self, x):
+        return self.data * x
+
+# class MultiplyLayer(nn.Module):
+#     def __init__(self, alpha_init=1.0):  # Initialize with a default value
+#         super(MultiplyLayer, self).__init__()
+#         self.alpha = nn.Parameter(torch.tensor(alpha_init))  # Create a learnable parameter
+
+#     def forward(self, x):
+#         return x * self.alpha
 
 class AngleOffsetModule(nn.Module):
     def __init__(self):
@@ -379,8 +394,10 @@ class PointPropagate(nn.Module):
             phasor_nircam_opd = wavefront.forward_wfe(phasor_lyot, self.nircam_offsets(self.nircam_opd[:, i]), wavelenghts[i])
             phasor = (self.y_mat[i].T @ phasor_nircam_opd) @ self.x_mat[i]
             phasor *= self.mult[i]
-            w = (self.flux_correction() + wavefront.peak_flux) ** 0.5
+            # w = (wavefront.peak_flux) ** 0.5
+            w = (wavefront.peak_flux) ** 0.5
             out = (torch.abs(phasor) * w) ** 2 
+            # out = (torch.abs(phasor) * self.flux_correction(0.)**0.5) ** 2 
             if self.oversample != 1:
                 # Rebin while conserving flux
                 out = torch.sum(torch.reshape(out, (1,self.num_det_px,self.oversample,self.num_det_px,self.oversample)), (2,4))
@@ -393,6 +410,8 @@ class PointPropagate(nn.Module):
         # output = torch.flip(output, dims=(-2,))
 
         # output = torch.mul(output,self.flux_correction())
+
+        output = self.flux_correction(output)
 
         # Valid for NIRCam; right sigma probably depends on filter/detector/etc
         # Charge diffusion, probably the most significant detector effect at play here
@@ -436,6 +455,12 @@ if __name__ == "__main__":
     parser.add_argument('--OPD_loss_weight', default=None, type=float)
     parser.add_argument('--smooth', default=None, type=float)
     parser.add_argument('--use_simulated_data', action='store_true')
+    parser.add_argument('--no_median', action='store_true')
+    parser.add_argument('--stage_fluxpos_cutoff_iter', default=0, type=int)
+    parser.add_argument('--sci_targ_name', default=None, type=str)
+    parser.add_argument('--ref_cutoff_iter', default=500, type=int)
+    
+
     args = parser.parse_args()
 
     DEVICE = 'cuda'
@@ -467,7 +492,10 @@ if __name__ == "__main__":
     sampledWFEs = F.interpolate(sampledWFEs[:, None], size=(wf_npix, wf_npix), mode='bilinear').squeeze()
     wfe_batch = sampledWFEs.contiguous().to(DEVICE)
 
-    sampledWFEs_after = np.load('/projects/b1094/rodrigoyeah/optics_jwst/EDDO_repo/EDDO/4050_data_for_diff_modeling/group_2_after/masks_2048/observation_opd.npy')
+    if args.sci_targ_name is None:
+        sampledWFEs_after = np.load('/projects/b1094/rodrigoyeah/optics_jwst/EDDO_repo/EDDO/4050_data_for_diff_modeling/group_2_after/masks_2048/observation_opd.npy')
+    elif args.sci_targ_name == 'HR8799':
+        sampledWFEs_after = np.load('/projects/b1094/rodrigoyeah/optics_jwst/EDDO_repo/EDDO/HR8799stuff/after_data/masks_2048/observation_opd.npy')
     sampledWFEs_after = np.flip(sampledWFEs_after, axis=0)[None]
     sampledWFEs_after = torch.from_numpy(sampledWFEs_after.copy()).float()
     sampledWFEs_after = F.interpolate(sampledWFEs_after[:, None], size=(wf_npix, wf_npix), mode='bilinear').squeeze()
@@ -482,7 +510,7 @@ if __name__ == "__main__":
 
     contrast_normalization = 0.003716380479003919
     sim_to_real_scaling = 2.1722325193439986 # from comparing the simulation with the peak brightness of the real data; VERY ROUGH! To be fixed
-    photons_normalization = 90578.00102527262 * sim_to_real_scaling *1e4#THREE CORRECTIONs # mJy/sr
+    photons_normalization = 90578.00102527262 * sim_to_real_scaling *1e4 / 2251.24456327477#THREE CORRECTIONs # mJy/sr
     peak_flux_star  = nn.Parameter(torch.FloatTensor([photons_normalization / contrast_normalization]))
 
     offset_STAR = nn.Parameter(torch.FloatTensor([args.star_offset_x * arcsec2rad(psf_pixel_scale), args.star_offset_y * arcsec2rad(psf_pixel_scale)]))
@@ -522,7 +550,10 @@ if __name__ == "__main__":
     reference = torch.from_numpy(reference).to(DEVICE)
 
     # print('YES reference median, sum ', reference.detach().median(), reference.detach().sum())
-    ref_scaled = reference / reference.median()
+    if not args.no_median:
+        ref_scaled = reference / reference.median()
+    else: 
+        ref_scaled = reference
 
     # print('YES ref_scaled median, sum ', ref_scaled.detach().median(), ref_scaled.detach().sum())
 
@@ -530,7 +561,11 @@ if __name__ == "__main__":
     # scale by median before subtraction
     real_im = np.load(f'{args.data_dir}/real_data/{args.measurement_file}')[:1, edge1:edge2, edge1:edge2]
     observations = torch.from_numpy(real_im.astype(np.float32)).to(DEVICE)
-    obs_scaled = observations / observations.median()
+    
+    if not args.no_median:
+        obs_scaled = observations / observations.median()
+    else:
+        obs_scaled = observations
 
 
     observations = torch.from_numpy(real_im.astype(np.float32)).to(DEVICE)
@@ -558,7 +593,7 @@ if __name__ == "__main__":
             IEC_RMS1 = F.interpolate(IEC_RMS1[:, None], size=(wf_npix, wf_npix), mode='bilinear').squeeze()
             IEC_RMS1 = IEC_RMS1.contiguous().to(DEVICE)
 
-            wavefronts_list_simulated = [Wavefront(wf_npix, diameter, wl, peak_flux_star, true_offset).to(DEVICE) for wl in wlen_weights[0]]
+            wavefronts_list_simulated = [Wavefront(wf_npix, diameter, wl, peak_flux_star*100, true_offset).to(DEVICE) for wl in wlen_weights[0]]
             wfe_sim_interp = wfe_batch_list[0] + (wfe_batch_list[1] - wfe_batch_list[0]) * 0.5
             wfe_sim_interp_series = [wfe_sim_interp + (1*IEC_RMS1), wfe_sim_interp + (2*IEC_RMS1)]
             sim = [prop_models[j](wavefronts_list_simulated, wfe_sim_interp_series[j], wlen_weights[1], wlen_weights[0]) for j in range(len(prop_models))]
@@ -577,13 +612,25 @@ if __name__ == "__main__":
             np.save(f'{vis_dir}/simulated_obs_no_planet.npy',sim.detach().cpu().numpy())
             # Whatever, set observation and reference as the same
             observations = torch.clone(sim[None])
-            obs_scaled = observations #/ observations.median()
+            if not args.no_median:
+                obs_scaled = observations / observations.median()
+            else:
+                obs_scaled = observations
 
             reference = torch.clone(sim[None]) 
-            ref_scaled = reference #/ reference.median()
+
+            if not args.no_median:
+                ref_scaled = reference / reference.median()
+            else:
+                ref_scaled = reference
 
 
-    pred_scaled = pred / pred.median()
+    if not args.no_median:
+        pred_scaled = pred / pred.median()
+    else:
+        pred_scaled = pred 
+
+    
     est_residual = (obs_scaled - pred_scaled).detach().cpu().mean(0).numpy()
     print('est residual shape is ', est_residual.shape)
     plt.imsave(f'{vis_dir}/vis_est_res_init.png', est_residual, cmap='viridis', origin='lower')
@@ -592,8 +639,12 @@ if __name__ == "__main__":
     plt.imsave(f'{vis_dir}/vis_ref_res_init.png', est_ref_residual, cmap='viridis', origin='lower')
 
     # scale by median before subtraction
-    obs_scaled = observations / observations.median()
-    pred_scaled = pred / pred.median()
+    if not args.no_median:
+        obs_scaled = observations / observations.median()
+        pred_scaled = pred / pred.median()
+    else:
+        obs_scaled = observations
+        pred_scaled = pred
     est_residual = (obs_scaled - pred_scaled).detach().cpu().mean(0).numpy()
     plt.imsave(f'{vis_dir}/vis_est_res_init.png', est_residual, cmap='viridis', origin='lower')
 
@@ -638,7 +689,7 @@ if __name__ == "__main__":
 
     progress_arr_target = []
 
-    cutoff_iter = args.iters +10
+    cutoff_iter = args.ref_cutoff_iter
 
     tbar = tqdm.tqdm(range(args.iters + 1))
     for i in tbar:
@@ -651,23 +702,32 @@ if __name__ == "__main__":
         #     print('YES pred_1 median, sum ', pred_1.detach().median(), pred_1.detach().sum())
 
         # compute loss in median-scaled space
-        pred_scaled = pred_1 #/ pred_1.detach().median()
+        if not args.no_median:
+            pred_scaled = pred_1 / pred_1.detach().median()
+        else:
+            pred_scaled = pred_1
         # if i%100==0:
         #     print('YES pred_scaled median, sum ', pred_scaled.detach().median(), pred_scaled.detach().sum())
         est_residual_obs = obs_scaled - pred_scaled.detach()
 
         est_residual_ref = ref_scaled - pred_scaled.detach()
-        # if i%100==0:
-        #     print('YES flux factor correction 1 is ', prop_models[0].flux_correction.forward())
-        #     print('YES flux factor correction 2 is ', prop_models[1].flux_correction.forward())
-        #     print('YES flux angles 1 is ', prop_models[0].angle_offsets.forward())
-        #     print('YES flux angles 2 is ', prop_models[1].angle_offsets.forward())
+        if i%100==0:
+            with torch.no_grad():
+                print('YES flux factor correction 1 is ', prop_models[0].flux_correction.forward(1.))
+                # print('YES flux factor correction 2 is ', prop_models[1].flux_correction.forward(0.))
+                print('YES flux angles 1 is ', prop_models[0].angle_offsets.forward())
+                # print('YES flux angles 2 is ', prop_models[1].angle_offsets.forward())
+                print('pred scaled max is ', pred_scaled.max())
+                print('original data scaled is ', ref_scaled.max())
 
         global_l1_loss = F.smooth_l1_loss(pred_scaled, ref_scaled)
         obs_l1_loss = F.l1_loss(pred_scaled, obs_scaled)
 
         if i > cutoff_iter:
-            loss = 0.001*obs_l1_loss
+            if i < (args.stage_fluxpos_cutoff_iter + cutoff_iter):
+                loss = obs_l1_loss
+            else:
+                loss = 0.5*obs_l1_loss
         else:
             loss = global_l1_loss
 
@@ -676,6 +736,11 @@ if __name__ == "__main__":
             opd2 = prop_models[1].wfe_offsets.forward(wfe_batch_list[1])
 
             TVL = (total_variation_loss(opd1) + total_variation_loss(opd2))/2.
+
+            nircam_opd = prop_models[0].nircam_offsets.get_res()
+            nircam_op1 = prop_models[1].nircam_offsets.get_res()
+
+            TVL += (total_variation_loss(nircam_opd) + total_variation_loss(nircam_op1))/2.
 
             if i > cutoff_iter:
                 # loss = 0.001*obs_l1_loss
@@ -721,10 +786,49 @@ if __name__ == "__main__":
             for p_model in prop_models:
                 for t in p_model.wfe_offsets.parameters():
                     if t.requires_grad:
-                        t.grad *= 0.0
+                        t.grad *= 1.0
+            if i < (args.stage_fluxpos_cutoff_iter + cutoff_iter):
+                with torch.no_grad():
+                    tot_flux_pred = pred_scaled.sum()
+                    tot_flux_target = obs_scaled.sum()
+                    flux_mismatch_ratio = tot_flux_target / tot_flux_pred
+                    if i%100 == 0:
+                        print('flux mismatch ratio SCI is ', flux_mismatch_ratio)
+                    for p_model in prop_models:
+                        p_model.flux_correction.data *=flux_mismatch_ratio.to(DEVICE)#nn.Parameter(flux_mismatch_ratio.to(DEVICE))
+                    for p_model in prop_models:
+                        for t in p_model.wfe_offsets.parameters():
+                            if t.requires_grad:
+                                t.grad *= 0.0
+                        for t in p_model.nircam_offsets.parameters():
+                            if t.requires_grad:
+                                t.grad *= 0.0
                 # for t in p_model.nircam_offsets.parameters():
                 #     if t.requires_grad:
                 #         t.grad *= 0.01
+        if i < args.stage_fluxpos_cutoff_iter:
+            # Try manual fit of the flux, since optimization is being funny
+            with torch.no_grad():
+                tot_flux_pred = pred_scaled.sum()
+                if i > cutoff_iter:
+                    tot_flux_target = obs_scaled.sum()
+                else:
+                    tot_flux_target = ref_scaled.sum()
+
+                flux_mismatch_ratio = tot_flux_target / tot_flux_pred
+                if i%100 == 0:
+                    print('flux mismatch ratio is ', flux_mismatch_ratio)
+                for p_model in prop_models:
+                    p_model.flux_correction.data *=flux_mismatch_ratio.to(DEVICE)#nn.Parameter(flux_mismatch_ratio.to(DEVICE))
+                
+            for p_model in prop_models:
+                for t in p_model.wfe_offsets.parameters():
+                    if t.requires_grad:
+                        t.grad *= 0.0
+                for t in p_model.nircam_offsets.parameters():
+                    if t.requires_grad:
+                        t.grad *= 0.0
+
 
         optimizer.step()
         scheduler.step()
@@ -769,12 +873,13 @@ if __name__ == "__main__":
 
             # cur_opd = prop_models[2].wfe_offsets.get_res().squeeze().detach().cpu()
             # opd_vis_arr2.append(cur_opd)
+            curr_nircam_opd_1 = prop_models[1].nircam_offsets.get_res().squeeze().detach().cpu()
+            nircam_opd_vis_arr_1.append(curr_nircam_opd_1)
 
         curr_nircam_opd = prop_models[0].nircam_offsets.get_res().squeeze().detach().cpu()
         nircam_opd_vis_arr.append(curr_nircam_opd)
 
-        curr_nircam_opd_1 = prop_models[1].nircam_offsets.get_res().squeeze().detach().cpu()
-        nircam_opd_vis_arr_1.append(curr_nircam_opd_1)
+        
         tbar_out = {'loss': global_l1_loss.item()}
         tbar.set_postfix(tbar_out)
 

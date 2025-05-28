@@ -170,7 +170,7 @@ class ShiftModule(nn.Module):
         grid[:, :, 0] = 2.0 * grid[:, :, 0] / (width - 1) - 1.0
         grid[:, :, 1] = 2.0 * grid[:, :, 1] / (height - 1) - 1.0
         self.grid = nn.Parameter(grid[None], requires_grad=False)
-        self.rotation = nn.Parameter(torch.zeros(1))
+        self.rotation = nn.Parameter(torch.zeros(1), requires_grad=True)
         self.scale = nn.Parameter(torch.ones(1), requires_grad=learn_scale)
 
     def forward(self, x):
@@ -465,6 +465,8 @@ class PointPropagate(nn.Module):
         self.oversample = oversample
 
         self.lyot_shifts = ShiftModule(lyot.shape[-2], lyot.shape[-1])
+        # self.lyot_shifts.x_shift = nn.Parameter(torch.FloatTensor([100.]), requires_grad=True)
+        # self.lyot_shifts.y_shift = nn.Parameter(torch.FloatTensor([100.]), requires_grad=True)
         self.fpm_shifts = ShiftModule(fpm.shape[-2], fpm.shape[-1])
         self.nircam_offsets = GridOffsetModule(nircam_opd.shape[-2], nircam_opd.shape[-1])
 
@@ -497,8 +499,10 @@ class PointPropagate(nn.Module):
         self.mult = nn.Parameter(torch.stack(mults), requires_grad=False)
 
 
-    def forward(self, wavefront_list, wfe, wl_weights, wavelenghts):
+    def forward(self, wavefront_list, wfe, wl_weights, wavelenghts, save_wf=False):
         output = None
+        if save_wf:
+            wftoreturn = []
         wfe_ = self.wfe_offsets(wfe)
         for i in range(len(wl_weights)):
             wavefront = wavefront_list[i]
@@ -510,6 +514,8 @@ class PointPropagate(nn.Module):
             phasor_lyot = wavefront.forward(phasor_fpm, self.lyot_shifts(self.lyot))
             # phasor_lyot = phasor_fpm
             phasor_nircam_opd = wavefront.forward_wfe(phasor_lyot, self.nircam_offsets(self.nircam_opd[:, i]), wavelenghts[i])
+            if save_wf and i ==0:
+                wftoreturn.append(torch.clone(phasor_nircam_opd))
             phasor = (self.y_mat[i].T @ phasor_nircam_opd) @ self.x_mat[i]
             phasor *= self.mult[i]
             # w = (wavefront.peak_flux) ** 0.5
@@ -542,8 +548,10 @@ class PointPropagate(nn.Module):
         # Charge diffusion, probably the most significant detector effect at play here
         # Other detector effects can be added as convolutions with the kernels in the data/detector_kernels folder
         # output = v2.GaussianBlur(kernel_size=3, sigma=0.28)(output)
-
-        return output
+        if save_wf:
+            return output, wftoreturn
+        else:
+            return output
 
     def forward_val(self, wavefront):
         phasor = wavefront.get_phasor()
@@ -589,7 +597,7 @@ if __name__ == "__main__":
     parser.add_argument('--sci_which_int', default=0, type=int)
     parser.add_argument('--reference_noisemap', default=None, type=str)
     parser.add_argument('--measurement_noisemap', default=None, type=str)
-    
+    parser.add_argument('--fit_Lyot', action='store_true')
     
 
     args = parser.parse_args()
@@ -626,7 +634,7 @@ if __name__ == "__main__":
     if args.sci_targ_name is None:
         sampledWFEs_after = np.load('/projects/b1094/rodrigoyeah/optics_jwst/EDDO_repo/EDDO/4050_data_for_diff_modeling/group_2_after/masks_2048/observation_opd.npy')
     elif args.sci_targ_name == 'HR8799':
-        sampledWFEs_after = np.load('/projects/b1094/rodrigoyeah/optics_jwst/EDDO_repo/EDDO/HR8799stuff/after_data/masks_2048/observation_opd.npy')
+        sampledWFEs_after = np.load('/projects/b1094/rodrigoyeah/optics_jwst/EDDO_repo/EDDO/HR8799stuff/after_data_newversion/masks_2048/observation_opd.npy')
     sampledWFEs_after = np.flip(sampledWFEs_after, axis=0)[None]
     sampledWFEs_after = torch.from_numpy(sampledWFEs_after.copy()).float()
     sampledWFEs_after = F.interpolate(sampledWFEs_after[:, None], size=(wf_npix, wf_npix), mode='bilinear').squeeze()
@@ -840,6 +848,9 @@ if __name__ == "__main__":
         optics_params = list()
         for p_model in prop_models:
             optics_params+=list(p_model.angle_offsets.parameters())
+            if args.fit_Lyot:
+                optics_params+=list(p_model.lyot_shifts.parameters())
+
             optics_params +=  list(p_model.nircam_offsets.parameters()) + list(p_model.wfe_offsets.parameters()) #+ list(p_model.charge_diffusion.parameters()) #+ list(p_model.flux_correction.parameters())
             if args.fit_everything:
                 optics_params+= list(p_model.fpm_shifts.parameters()) + list(p_model.lyot_shifts.parameters()) + list(p_model.flux_correction.parameters())
@@ -857,16 +868,22 @@ if __name__ == "__main__":
     else:
         optics_params_normal_lr = list()
         optics_params_bigger_lr = list()
+        optics_params_even_bigger_lr = list()
 
-        bigger_lr = args.lr*0.00000000000000000000001
+        bigger_lr = args.lr*3.
+        even_bigger_lr = args.lr
 
         for p_model in prop_models:
+            # if args.fit_Lyot:
             optics_params_bigger_lr+=list(p_model.angle_offsets.parameters())
-            optics_params_normal_lr+=list(p_model.nircam_offsets.parameters()) + list(p_model.wfe_offsets.parameters()) #+ list(p_model.charge_diffusion.parameters()) #+ list(p_model.flux_correction.parameters())
+            optics_params_even_bigger_lr+=list(p_model.wfe_offsets.parameters())
+            # optics_params_normal_lr+=list(p_model.angle_offsets.parameters())
+            optics_params_normal_lr+=list(p_model.nircam_offsets.parameters()) #+ list(p_model.wfe_offsets.parameters()) #+ list(p_model.charge_diffusion.parameters()) #+ list(p_model.flux_correction.parameters())
 
         optimizer_argument = [
             {'params': optics_params_normal_lr, 'lr': args.lr},
-            {'params': optics_params_bigger_lr, 'lr': bigger_lr}
+            {'params': optics_params_bigger_lr, 'lr': bigger_lr},
+            {'params': optics_params_even_bigger_lr, 'lr': even_bigger_lr}
         ]
 
         optimizer_sgd = torch.optim.SGD(optimizer_argument, momentum=0.9)
@@ -899,6 +916,9 @@ if __name__ == "__main__":
 
     progress_arr_target = []
 
+    if args.fit_Lyot:
+        lyot_arr = []
+
     progress_fluxcorrection = []
 
     cutoff_iter = args.ref_cutoff_iter
@@ -915,8 +935,19 @@ if __name__ == "__main__":
         scheduler = scheduler_sgd if i < switch_step else scheduler_adam
 
         optimizer.zero_grad()
-
-        pred_1 = [prop_models[j](wavefronts_list1, wfe_batch_list[j], wlen_weights[1], wlen_weights[0]) for j in range(len(prop_models))]
+        if i == args.iters:
+            pred_1 = []
+            print('ENTERING PHASOR')
+            for j in range(len(prop_models)):
+                res, wf = prop_models[j](wavefronts_list1, wfe_batch_list[j], wlen_weights[1], wlen_weights[0],save_wf=True)
+                print('RESULT PHASOR')
+                pred_1.append(res)
+                wfnumpy = wf[0].detach().cpu().numpy()
+                print('DETACHED PHASOR')
+                np.save(f'{vis_dir}/last_iteration_TOTALWAVEFRONT_oversample_{args.oversample}_wl_sampling_{args.num_wl}.npy',wfnumpy)
+                print('SAVED PHASOR')
+        else:
+            pred_1 = [prop_models[j](wavefronts_list1, wfe_batch_list[j], wlen_weights[1], wlen_weights[0]) for j in range(len(prop_models))]
         pred_1 = torch.mean(torch.cat(pred_1, 0), 0)[None]
 
         # if i%100==0:
@@ -940,7 +971,6 @@ if __name__ == "__main__":
                 # # print('YES flux angles 2 is ', prop_models[1].angle_offsets.forward())
                 # print('pred scaled max is ', pred_scaled.max())
                 # print('original data scaled is ', ref_scaled.max())
-
 
         if args.px_mask_file is not None:
             if args.reference_noisemap is not None:
@@ -1030,6 +1060,32 @@ if __name__ == "__main__":
                 loss = loss + args.OPD_loss_weight * opds_disimilarity * 1e15
 
             # loss = loss + args.OPD_loss_weight * opds_disimilarity
+        elif args.OPD_loss_weight is not None:
+            opd = prop_models[0].wfe_offsets.forward(wfe_batch_list[0])
+            # opd2 = prop_models[1].wfe_offsets.forward(wfe_batch_list[1])
+
+            # print('OPD is ', opd1)
+            # print('OPD 2 is ', opd2)
+
+            # opd1_scaled = opd1 #/ opd1.detach().median()
+            # opd2_scaled = opd2 #/ opd2.detach().median()
+
+            # print('OPD is scale ', opd1_scaled)
+            # print('OPD 2 is scale', opd2_scaled)
+
+            opds_disimilarity_before = F.smooth_l1_loss(opd, wfe_batch_list[0])
+            opds_disimilarity_after = F.smooth_l1_loss(opd, wfe_batch_list[1])
+
+            opds_total_disimilarity = opds_disimilarity_before + opds_disimilarity_after
+
+            # print('DISIMILARITY ', opds_disimilarity) 
+            # print('BIG LOSS IS ', loss)
+
+            if i > cutoff_iter:
+                # loss = 0.001*obs_l1_loss
+                loss = loss + args.OPD_loss_weight * opds_total_disimilarity * 1e15
+            else:
+                loss = loss + args.OPD_loss_weight * opds_total_disimilarity * 1e15
 
         # prior_loss = 0
         # for p in prop_models:
@@ -1055,6 +1111,31 @@ if __name__ == "__main__":
             #         print('---------------------- flux name is ', name)
             #         print('---------------------- flux GRAD', j.grad)
             #         print('---------------------- flux GRAD', j.item())
+        
+        if i%100==0:
+            with torch.no_grad():
+                print('LYOT PARAMS! Before grad boost ')
+                for name, j in prop_models[0].lyot_shifts.named_parameters():
+                    if j.requires_grad:
+                        print('---------------------- LYOT PARAM name is ', name)
+                        print('---------------------- LYOT PARAM GRAD', j.grad)
+                        print('---------------------- LYOT PARAM VALUE IS', j.item())
+
+        # for p_model in prop_models:
+        #     for t in p_model.lyot_shifts.parameters():
+        #         if t.requires_grad and t.grad is not None:
+        #             t.grad *= 1.0
+
+        if i%100==0:
+            with torch.no_grad():
+                print('LYOT PARAMS! After grad boost ')
+                for name, j in prop_models[0].lyot_shifts.named_parameters():
+                    if j.requires_grad:
+                        print('---------------------- LYOT PARAM name is ', name)
+                        print('---------------------- LYOT PARAM GRAD', j.grad)
+                        print('---------------------- LYOT PARAM VALUE IS', j.item())
+
+
         if i > cutoff_iter:
             for p_model in prop_models:
                 for t in p_model.wfe_offsets.parameters():
@@ -1163,6 +1244,12 @@ if __name__ == "__main__":
         cur_opd = prop_models[0].wfe_offsets.forward(wfe_batch_list[0]).squeeze().detach().cpu()
         opd_vis_arr.append(cur_opd)
 
+        if args.fit_Lyot:
+            with torch.no_grad():
+                result= prop_models[0].lyot_shifts(prop_models[0].lyot)
+                # print('RESULT shape IS ', result.shape)
+                lyot_arr.append(result.detach().cpu())
+
         opd_vis_offset_arr.append(prop_models[0].wfe_offsets.get_res().squeeze().detach().cpu())
         angles_offset_res.append(prop_models[0].angle_offsets())
         progress_fluxcorrection.append(prop_models[0].flux_correction(1.))
@@ -1186,7 +1273,8 @@ if __name__ == "__main__":
         tbar_out = {'loss': global_l1_loss.item()}
         tbar.set_postfix(tbar_out)
 
-    progress_arr = torch.stack(progress_arr_reference).cpu().numpy()[::5]
+    visvidfreq = 10
+    progress_arr = torch.stack(progress_arr_reference).cpu().numpy()[::visvidfreq]
     progress_arr = np.array([(im - im.min()) / (im.max() - im.min()) for im in progress_arr])
     progress_arr = np.uint8(cm.viridis(progress_arr) * 255)
     progress_arr = np.flip(progress_arr, 1)
@@ -1196,6 +1284,9 @@ if __name__ == "__main__":
     psf_pixel_scale = 0.062424185
     target_numpys = np.squeeze(torch.stack(progress_arr_target).cpu().numpy())
     opd_vis_arr_numpys = np.squeeze(opd_vis_arr[-1].cpu().numpy())
+
+    if args.fit_Lyot:
+        lyot_arr_numpys = np.squeeze(lyot_arr[-1].cpu().numpy())
 
     opd_vis_offset_arr_numpys = np.squeeze(opd_vis_offset_arr[-1].cpu().numpy())
 
@@ -1279,7 +1370,7 @@ if __name__ == "__main__":
     # np.save(f'{vis_dir}/max_snr_iteration_oversample_{args.oversample}_wl_sampling_{args.num_wl}.npy', target_numpys[np.array(snr_list).argmax()])
 
 
-    progress_arr = torch.stack(progress_arr_target).cpu().numpy()[::5]
+    progress_arr = torch.stack(progress_arr_target).cpu().numpy()[::visvidfreq]
     progress_arr = np.array([(im - im.min()) / (im.max() - im.min()) for im in progress_arr])
     progress_arr = np.uint8(cm.viridis(progress_arr) * 255)
     progress_arr = np.flip(progress_arr, 1)
@@ -1287,12 +1378,24 @@ if __name__ == "__main__":
                     'FFMPEG', **{'macro_block_size': None, 'ffmpeg_params': ['-s','256x256', '-v', '0'], 'fps': 30, })
 
 
-    # opd_vis_arr = torch.stack(opd_vis_arr)[::5]
-    # opd_vis_arr = (opd_vis_arr - opd_vis_arr[0:1]).abs().numpy()
-    # opd_vis_arr = (opd_vis_arr - opd_vis_arr.min()) / (opd_vis_arr.max() - opd_vis_arr.min())
-    # opd_vis_arr = np.uint8(cm.coolwarm(opd_vis_arr) * 255)
-    # imageio.mimsave(f'{vis_dir}/opd_progress.mp4', opd_vis_arr, 
-    #                 'FFMPEG', **{'macro_block_size': None, 'fps': 30, })
+    opd_vis_arr = torch.stack(opd_vis_arr)[::visvidfreq]
+    opd_vis_arr = (opd_vis_arr - opd_vis_arr[0:1]).abs().numpy()
+    opd_vis_arr = (opd_vis_arr - opd_vis_arr.min()) / (opd_vis_arr.max() - opd_vis_arr.min())
+    opd_vis_arr = np.uint8(cm.coolwarm(opd_vis_arr) * 255)
+    # print('opd vis arr shape is ', opd_vis_arr.shape)
+    imageio.mimsave(f'{vis_dir}/opd_progress.mp4', opd_vis_arr, 
+                    'FFMPEG', **{'macro_block_size': None, 'fps': 30, })
+    
+    if args.fit_Lyot:
+        lyot_arr = torch.stack(lyot_arr)[::visvidfreq]
+        print('LYOT ARR SHAPE ONEEEEEE IS ', lyot_arr.shape)
+        # lyot_arr = (lyot_arr - lyot_arr[0:1]).abs().numpy()
+        lyot_arr = (lyot_arr - lyot_arr.min()) / (lyot_arr.max() - lyot_arr.min())
+        lyot_arr = np.uint8(cm.binary(lyot_arr.numpy())* 255)
+        lyot_arr = np.squeeze(lyot_arr)
+        print('LYOT ARR SHAPE IS ', lyot_arr.shape)
+        imageio.mimsave(f'{vis_dir}/lyot_progress.mp4', lyot_arr, 
+                        'FFMPEG', **{'macro_block_size': None, 'fps': 30, })
     # if args.num_ints > 1:
     #     opd_vis_arr = torch.stack(opd_vis_arr1)[::5]
     #     opd_vis_arr = (opd_vis_arr - opd_vis_arr[0:1]).abs().numpy()
