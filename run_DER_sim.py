@@ -270,7 +270,7 @@ if __name__ == "__main__":
     parser.add_argument('--data_dir', default='./FilesJWSTMasks/masks_1024', type=str)
     parser.add_argument('--opd_data_dir', default='./OPDs_JWST_dates', type=str)
     parser.add_argument('--scene_name', default='guidestar', type=str)
-    parser.add_argument('--num_t', help='Number of measurements', default=1, type=int)
+    parser.add_argument('--num_t', help='Number of measurements', default=10, type=int)
     parser.add_argument('--contrast_mult', default=1, type=float)
     parser.add_argument('--contrast_exp', default=-5, type=int)
     parser.add_argument('--vis_freq', default=100, type=int)
