@@ -17,6 +17,7 @@ torch.backends.cudnn.benchmark = False
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributions as dist
+from scipy.stats import t as student_t
 
 from dl_utils import pixel_coords, crop_to, circle, arcsec2rad, partial_MFT
 
@@ -270,7 +271,7 @@ if __name__ == "__main__":
     parser.add_argument('--data_dir', default='./FilesJWSTMasks/masks_1024', type=str)
     parser.add_argument('--opd_data_dir', default='./OPDs_JWST_dates', type=str)
     parser.add_argument('--scene_name', default='guidestar', type=str)
-    parser.add_argument('--num_t', help='Number of measurements', default=10, type=int)
+    parser.add_argument('--num_t', help='Number of measurements', default=1, type=int)
     parser.add_argument('--contrast_mult', default=1, type=float)
     parser.add_argument('--contrast_exp', default=-5, type=int)
     parser.add_argument('--vis_freq', default=100, type=int)
@@ -559,26 +560,20 @@ if __name__ == "__main__":
 
         batch_ids = torch.arange(N)
         cur_wfe = wfe_batch[batch_ids]
+        
 
-        noisy_obs = input_original[batch_ids].clone()
-        shot_std = args.shot_noise * torch.sqrt(noisy_obs)
-        shot_noise = torch.normal(mean=noisy_obs, std=shot_std) - noisy_obs
-        read_std = args.read_noise
-        read_noise = torch.normal(mean=0.0, std=read_std, size=noisy_obs.shape, device=noisy_obs.device)
-        total_noise = shot_noise + read_noise
-        noisy_obs += total_noise
         if der_loss:
             pred_1, nu, alpha, beta, al_uq, ep_uq = p1_model(plane_wave_1, cur_wfe)
         else:
             pred_1 = p1_model(plane_wave_1, cur_wfe)
 
         if args.loss_fn == 'L2':
-            loss = (pred_1 - noisy_obs).pow(2).sum() / loss_scale
+            loss = (pred_1 - observations[batch_ids]).pow(2).sum() / loss_scale
         else:
-            loss = (pred_1 - noisy_obs).abs().sum() / loss_scale
+            loss = (pred_1 - observations[batch_ids]).abs().sum() / loss_scale
 
         if der_loss:
-            loss += quant_evi_loss(noisy_obs, pred_1, nu, alpha, beta, 0.5, coeff=1.0, reduce=True).sum()
+            loss += quant_evi_loss(observations[batch_ids], pred_1, nu, alpha, beta, 0.5, coeff=1.0, reduce=True).sum()
 
 
         loss.backward()
@@ -594,6 +589,7 @@ if __name__ == "__main__":
             with torch.no_grad():
                 if der_loss:
                     e_pred, nu, alpha, beta, al_uq, ep_uq = p1_model(plane_wave_1, wfe_batch)
+                    np.save(f'{vis_dir}/gamma_{i}.npy', e_pred.detach().cpu().numpy())
                 else:
                     e_pred = p1_model(plane_wave_1, wfe_batch).detach().cpu()
             est_residual = torch.relu(out - e_pred).detach().cpu().numpy()
@@ -609,6 +605,18 @@ if __name__ == "__main__":
                 np.save(f'{vis_dir}/al_uq_{i}.npy', al_uq.squeeze(0).detach().cpu().numpy())
                 np.save(f'{vis_dir}/ep_uq_{i}.npy', ep_uq.squeeze(0).detach().cpu().numpy())
                 np.save(f'{vis_dir}/read_noise_{i}.npy', read_noise.detach().cpu().numpy())
+                # for each pixel define the student_t
+                likelihood_geq_t = torch.zeros((1, e_pred.shape[1], e_pred.shape[2]), device=DEVICE)
+                for j in range(est_residual.shape[1]):
+                    for k in range(est_residual.shape[2]):
+                        t_value = out[0, j, k].item()
+                        prob = student_t.cdf(t_value, 
+                                             loc=e_pred[0, j, k].item(), 
+                                             scale=((beta[0, j, k].item())*(1 + nu[0, j, k].item()) / nu[0, j, k].item() / alpha[0, j, k].item()), 
+                                             df=2*alpha[0, j, k].item())
+                        likelihood_geq_t[0, j, k] = 1 - prob
+                np.save(f'{vis_dir}/likelihood_geq_t_{i}.npy', likelihood_geq_t.detach().cpu().numpy())
+
 
         if args.log_progress:
             cur_est = torch.relu(observations[batch_ids] - pred_1).detach().cpu().numpy()
@@ -624,3 +632,61 @@ if __name__ == "__main__":
         imageio.mimsave(f'{vis_dir}/progress.mp4', progress_arr[::50], 
                         'FFMPEG', **{'macro_block_size': None, 'ffmpeg_params': ['-s','256x256', '-v', '0'], 'fps': 5, })
 
+    with torch.no_grad():
+        if der_loss:
+            est_star_psf, nu, alpha, beta, al_uq, ep_uq = p1_model(plane_wave_1, wfe_batch)
+        else:
+            est_star_psf = p1_model(plane_wave_1, wfe_batch).detach().cpu().numpy()
+    true_star_psf = out_1.detach().cpu().numpy()
+    est_residual_psf = torch.relu(out - est_star_psf).detach().cpu().numpy()
+    true_residual_psf = (out - out_1).detach().cpu().numpy()
+
+    psnr_init_star = peak_signal_noise_ratio(true_star_psf / true_star_psf.max(), init_est_star_psf / true_star_psf.max(), data_range=1)
+    ssim_init_star = structural_similarity(true_star_psf / true_star_psf.max(), init_est_star_psf / true_star_psf.max(), data_range=1, channel_axis=0)
+    psnr_star = peak_signal_noise_ratio(true_star_psf / true_star_psf.max(), est_star_psf / true_star_psf.max(), data_range=1)
+    ssim_star = structural_similarity(true_star_psf / true_star_psf.max(), est_star_psf / true_star_psf.max(), data_range=1, channel_axis=0)
+
+    div_norm = true_residual_psf.max()
+    true_residual_psf = true_residual_psf[:, begin_x:end_x, begin_y:end_y] / div_norm
+    init_est_residual_psf = init_est_residual_psf[:, begin_x:end_x, begin_y:end_y] / div_norm
+    est_residual_psf = est_residual_psf[:, begin_x:end_x, begin_y:end_y] / div_norm
+
+    psnr_init_residual = peak_signal_noise_ratio(true_residual_psf, init_est_residual_psf, data_range=1)
+    ssim_init_residual = structural_similarity(true_residual_psf, init_est_residual_psf, data_range=1, channel_axis=0)
+    snr_init_residual = np.mean(init_est_residual_psf) / np.std(init_est_residual_psf)
+    print(f'PSNR for the initial residual PSF: {psnr_init_residual:.2f} dB')
+    print(f'SSIM for the initial residual PSF: {ssim_init_residual:.4f}')
+    print(f'SNR for the initial residual PSF: {snr_init_residual:.2f}')
+
+    psnr_residual = peak_signal_noise_ratio(true_residual_psf, est_residual_psf, data_range=1)
+    ssim_residual = structural_similarity(true_residual_psf, est_residual_psf, data_range=1, channel_axis=0)
+    snr_residual = np.mean(est_residual_psf) / np.std(est_residual_psf)
+    print(f'PSNR for the residual PSF: {psnr_residual:.2f} dB')
+    print(f'SSIM for the residual PSF: {ssim_residual:.4f}')
+    print(f'SNR for the residual PSF: {snr_residual:.2f}')
+
+    wfe_mse = F.mse_loss(wfe_batch / wfe_gt.max(), wfe_gt / wfe_gt.max()).item()
+    wfe_psnr = np.log10(1 / wfe_mse)
+
+    quality_arr = np.array([psnr_init_star, ssim_init_star, psnr_init_residual, ssim_init_residual,
+                            psnr_star, ssim_star, psnr_residual, ssim_residual, wfe_mse, wfe_psnr])
+    np.save(f'{vis_dir}/quality.npy', quality_arr)
+
+    # Plot the loss curves
+    fig, ax = plt.subplots(1, 2, figsize=(10, 5))
+    ax[0].plot(img_loss_arr)
+    ax[0].set_title('Image Loss')
+    ax[0].set_xlabel('Iterations')
+    ax[1].plot(wfe_err_arr)
+    ax[1].set_title('WFE Loss')
+    ax[1].set_xlabel('Iterations')
+    plt.savefig(f'{vis_dir}/losses.png')
+
+    # Compare the GT WFEs and final WFEs
+    vis_wfe_gt = wfe_gt.detach().cpu().numpy()
+    vis_wfe_batch = wfe_batch.detach().cpu().numpy()
+    vis_wfe = np.concatenate([vis_wfe_gt, vis_wfe_batch], axis=2)
+    vis_wfe = (vis_wfe - vis_wfe.min()) / (vis_wfe.max() - vis_wfe.min())
+    vis_wfe = np.uint8(cm.viridis(vis_wfe) * 255)
+    ffmpeg_kargs = {'macro_block_size': None, 'ffmpeg_params': ['-s','512x256', '-v', '0'], 'fps': 4}
+    imageio.mimsave(f'{vis_dir}/vis_wfe.mp4', vis_wfe, 'FFMPEG', **ffmpeg_kargs)
