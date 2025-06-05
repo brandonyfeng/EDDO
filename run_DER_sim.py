@@ -606,15 +606,17 @@ if __name__ == "__main__":
                 np.save(f'{vis_dir}/ep_uq_{i}.npy', ep_uq.squeeze(0).detach().cpu().numpy())
                 np.save(f'{vis_dir}/read_noise_{i}.npy', read_noise.detach().cpu().numpy())
                 # for each pixel define the student_t
-                likelihood_geq_t = torch.zeros((1, e_pred.shape[1], e_pred.shape[2]), device=DEVICE)
+                likelihood_geq_t = torch.zeros((N, e_pred.shape[1], e_pred.shape[2]), device=DEVICE)
                 for j in range(est_residual.shape[1]):
                     for k in range(est_residual.shape[2]):
-                        t_value = out[0, j, k].item()
-                        prob = student_t.cdf(t_value, 
-                                             loc=e_pred[0, j, k].item(), 
-                                             scale=((beta[0, j, k].item())*(1 + nu[0, j, k].item()) / nu[0, j, k].item() / alpha[0, j, k].item()), 
-                                             df=2*alpha[0, j, k].item())
-                        likelihood_geq_t[0, j, k] = 1 - prob
+                        for n in range(N):
+                            t_value = out[n, j, k].item()
+                            prob = student_t.cdf(t_value, 
+                                                 loc=e_pred[n, j, k].item(), 
+                                                 scale=((beta[j, k].item())*(1 + nu[j, k].item()) / nu[j, k].item() / alpha[j, k].item()), 
+                                                 df=2*alpha[j, k].item())
+                            likelihood_geq_t[n, j, k] = 1 - prob
+                likelihood_geq_t = likelihood_geq_t.mean(dim=0)
                 np.save(f'{vis_dir}/likelihood_geq_t_{i}.npy', likelihood_geq_t.detach().cpu().numpy())
 
 
